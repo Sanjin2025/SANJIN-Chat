@@ -1,0 +1,3 @@
+-keep class com.sanjinchat.wear.** { *; }
+-keepattributes Signature
+-keepattributes *Annotation*

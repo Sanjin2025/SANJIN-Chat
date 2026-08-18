@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ==================== SanjinChat Wear OS 清单文件 ==================== -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ===== 权限声明 ===== -->
+    <!-- 网络访问（必须） -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 访问网络状态 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 录音（语音转文字） -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 震动（新消息通知） -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 唤醒锁（短暂保持 CPU 处理消息） -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 前台服务（保活可选） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- 通知（Android 13+） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Wear OS 设备特性 -->
+    <uses-feature android:name="android.hardware.type.watch" android:required="false" />
+
+    <application
+        android:name=".WearApp"
+        android:allowBackup="true"
+        android:icon="@android:drawable/sym_action_chat"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.SanjinWear"
+        android:usesCleartextTraffic="true"
+        tools:targetApi="31">
+
+        <!-- ========== 启动 Activity: 登录页 ========== -->
+        <activity
+            android:name=".LoginActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ========== 主界面: 消息列表 ========== -->
+        <activity
+            android:name=".ChatListActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize" />
+
+        <!-- ========== 聊天详情 ========== -->
+        <activity
+            android:name=".ChatDetailActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- ========== 设置页 ========== -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize" />
+
+    </application>
+</manifest>

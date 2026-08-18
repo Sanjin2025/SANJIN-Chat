@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- MD3 Primary Colors (SanJin Chat Purple Theme) -->
+    <color name="primary">#6750A4</color>
+    <color name="onPrimary">#FFFFFF</color>
+    <color name="primaryContainer">#EADDFF</color>
+    <color name="onPrimaryContainer">#21005D</color>
+
+    <color name="secondary">#625B71</color>
+    <color name="onSecondary">#FFFFFF</color>
+    <color name="secondaryContainer">#E8DEF8</color>
+    <color name="onSecondaryContainer">#1D192B</color>
+
+    <color name="tertiary">#7D5260</color>
+    <color name="onTertiary">#FFFFFF</color>
+    <color name="tertiaryContainer">#FFD8E4</color>
+    <color name="onTertiaryContainer">#31111D</color>
+
+    <color name="error">#B3261E</color>
+    <color name="onError">#FFFFFF</color>
+    <color name="errorContainer">#F9DEDC</color>
+    <color name="onErrorContainer">#410E0B</color>
+
+    <color name="background">#1C1B1F</color>
+    <color name="onBackground">#E6E1E5</color>
+    <color name="surface">#1C1B1F</color>
+    <color name="onSurface">#E6E1E5</color>
+    <color name="surfaceVariant">#49454F</color>
+    <color name="onSurfaceVariant">#CAC4D0</color>
+
+    <color name="outline">#938F99</color>
+    <color name="outlineVariant">#49454F</color>
+    <color name="surfaceBright">#333037</color>
+    <color name="surfaceContainer">#2C2A30</color>
+    <color name="surfaceContainerLowest">#131216</color>
+    <color name="surfaceContainerLow">#232127</color>
+    <color name="surfaceContainerHigh">#38353C</color>
+    <color name="surfaceContainerHighest">#45424A</color>
+
+    <!-- Chat bubble colors -->
+    <color name="bubble_self">#4F378B</color>
+    <color name="bubble_other">#332D41</color>
+    <color name="text_me">#FFFFFF</color>
+    <color name="text_other">#E6E1E5</color>
+
+    <!-- Status colors -->
+    <color name="online_color">#4CAF50</color>
+    <color name="offline_color">#757575</color>
+</resources>

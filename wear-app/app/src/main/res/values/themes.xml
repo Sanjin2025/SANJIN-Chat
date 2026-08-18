@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ==================== 主题（MD2 深色 Material Design，适配 WearOS） ==================== -->
+<resources>
+
+    <!-- SanjinWear 主主题：继承 MaterialComponents 深色桥接主题，使其识别 colorPrimary / colorPrimaryDark / colorAccent -->
+    <style name="Theme.SanjinWear" parent="Theme.MaterialComponents.DayNight.NoActionBar.Bridge">
+        <!-- 状态栏 / 背景 -->
+        <item name="android:statusBarColor">@color/background</item>
+        <item name="android:windowBackground">@color/background</item>
+        <item name="android:navigationBarColor">@color/background</item>
+
+        <!-- 主色：MaterialComponents 识别的名字 -->
+        <item name="colorPrimary">@color/primary</item>
+        <item name="colorPrimaryVariant">@color/primary_dark</item>
+        <!-- colorPrimaryDark（android:statusBarColor 常用的兼容字段，仅用于 theme xml 展示用；colorPrimaryVariant 为新字段，同时保留） -->
+        <item name="colorPrimaryDark">@color/primary_dark</item>
+        <item name="colorSecondary">@color/accent</item>
+        <item name="colorAccent">@color/accent</item>
+        <item name="android:colorAccent">@color/accent</item>
+
+        <!-- 文字颜色 -->
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="android:textColorHint">@color/text_hint</item>
+
+        <!-- 无标题 / 无 ActionBar -->
+        <item name="android:windowNoTitle">true</item>
+        <item name="windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+    </style>
+
+    <!-- 圆形按钮样式 -->
+    <style name="WearButton">
+        <item name="android:minHeight">44dp</item>
+        <item name="android:minWidth">44dp</item>
+    </style>
+
+</resources>

@@ -1,0 +1,48 @@
+# ====== SanjinChat 开源 .gitignore ======
+
+# 敏感/运行时数据
+data/
+certs/
+tls.json
+
+# Node.js 依赖 & 运行时
+node_modules/
+nodejs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 服务端产物
+*.log
+*.pid
+
+# ====== Android / Gradle (wear-app & wearos) ======
+**/build/
+**/.gradle/
+**/*.apk
+**/*.aab
+**/*.ap_
+**/local.properties
+**/.idea/
+**/.kotlin/
+**/captures/
+**/gradle-app.setting
+wear-app/gradle-*/
+wear-app/*.zip
+wearos/gradle-*/
+wearos/*.zip
+
+# ====== 系统 / 编辑器 ======
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vs/
+.vscode/
+*~
+
+# ====== 环境变量 / 私有配置 ======
+.env
+.env.local
+.env.*.local
+.github-publish.env
