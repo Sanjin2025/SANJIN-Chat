@@ -7,6 +7,7 @@ data class User(
     val avatar: String? = null,
     val avatarType: String? = null,
     val avatarEmoji: String? = null,
+    val role: String = "user",   // "admin" 表示管理员
     val createdAt: Long = 0L
 )
 

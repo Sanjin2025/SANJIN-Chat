@@ -1,5 +1,5 @@
 // ==================== 自动清理模块 ====================
-// 每天凌晨 3 点删除 data/uploads/ 下超过 10 天的文件，启动时也执行一次
+// 每天凌晨 3 点删除 data/uploads/ 下超过 10 天的文件、清理 messages.json 中 10 天前的聊天记录，启动时也执行一次
 
 const fs = require('fs');
 const path = require('path');
@@ -68,7 +68,24 @@ async function runCleanup(dryRun = false) {
   const logMsg = `[清理] 已删除 ${deleted} 个过期文件（${EXPIRE_DAYS}天以上），跳过 ${skipped} 个，释放 ${(freedBytes / 1024 / 1024).toFixed(2)} MB`;
   console.log(logMsg);
 
-  return { deleted, skipped, freedBytes };
+  // ====== 清理 messages.json 中超过 10 天的聊天记录（含文本/语音/图片） ======
+  let prunedMessages = 0;
+  try {
+    const messages = storage.read('messages');
+    const cutoff = now - EXPIRE_MS;
+    const filtered = messages.filter(m => m.timestamp >= cutoff);
+    prunedMessages = messages.length - filtered.length;
+    if (prunedMessages > 0) {
+      if (!dryRun) {
+        await storage.write('messages', filtered);
+      }
+      console.log(`[清理] 已删除 ${prunedMessages} 条过期聊天记录（${EXPIRE_DAYS}天以上，含语音/图片/文本）`);
+    }
+  } catch (e) {
+    console.warn('[清理] 清理消息记录失败:', e.message);
+  }
+
+  return { deleted, skipped, freedBytes, prunedMessages };
 }
 
 /**

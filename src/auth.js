@@ -6,7 +6,60 @@ const storage = require('./storage');
 const multipart = require('./multipart');
 
 // token 存储：token -> { userId, createdAt }
-const tokenStore = new Map();
+// 使用持久化 Map：服务端重启后 token 仍然有效，避免「已登录用户调用 HTTP API 返回 401」
+class PersistentTokenStore extends Map {
+  constructor() {
+    super();
+    this._loaded = false;
+    try {
+      const data = storage.read('tokens');
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          if (item && item.token && item.userId) {
+            super.set(item.token, { userId: item.userId, createdAt: item.createdAt || Date.now() });
+          }
+        }
+      }
+      this._loaded = true;
+    } catch (err) {
+      console.error('[tokenStore] 加载持久化 token 失败:', err.message);
+    }
+  }
+
+  _persist() {
+    if (!this._loaded) return;
+    try {
+      const arr = Array.from(super.entries()).map(([token, rec]) => ({
+        token,
+        userId: rec.userId,
+        createdAt: rec.createdAt
+      }));
+      // 同步写盘：token 写入频率低，立即落盘保证不丢
+      storage.writeSync('tokens', arr);
+    } catch (err) {
+      console.error('[tokenStore] 持久化失败:', err.message);
+    }
+  }
+
+  set(token, record) {
+    super.set(token, record);
+    this._persist();
+    return this;
+  }
+
+  delete(token) {
+    const r = super.delete(token);
+    this._persist();
+    return r;
+  }
+
+  clear() {
+    super.clear();
+    this._persist();
+  }
+}
+
+const tokenStore = new PersistentTokenStore();
 
 // Emoji 头像白名单
 const EMOJI_AVATARS = ['🐱', '🐶', '🐰', '🦊', '🐼', '🐨', '🐯', '🦁', '🐮', '🐷', '🐸', '🐵'];
@@ -143,6 +196,37 @@ function searchUsers(keyword, excludeId) {
     )
     .map(sanitizeUser)
     .slice(0, 50);
+}
+
+/**
+ * 修改密码（需要验证旧密码）
+ * @param {string} userId
+ * @param {string} oldPassword 旧密码（明文）
+ * @param {string} newPassword 新密码（明文）
+ */
+async function changePassword(userId, oldPassword, newPassword) {
+  if (!oldPassword || !newPassword) throw new Error('旧密码和新密码不能为空');
+  if (newPassword.length < 6) throw new Error('新密码至少6位');
+  if (newPassword.length > 32) throw new Error('新密码最长32位');
+
+  const users = storage.read('users');
+  const idx = users.findIndex(u => u.id === userId);
+  if (idx === -1) throw new Error('用户不存在');
+
+  // 验证旧密码
+  if (!bcrypt.compareSync(oldPassword, users[idx].passwordHash)) {
+    throw new Error('旧密码错误');
+  }
+  // 新旧密码相同
+  if (oldPassword === newPassword) {
+    throw new Error('新密码不能与旧密码相同');
+  }
+
+  // 重新哈希新密码
+  users[idx].passwordHash = bcrypt.hashSync(newPassword, 10);
+  await storage.write('users', users);
+
+  return sanitizeUser(users[idx]);
 }
 
 /**
@@ -381,6 +465,7 @@ module.exports = {
   verifyRequest,
   getUserById,
   searchUsers,
+  changePassword,
   updateNickname,
   setAvatarEmoji,
   uploadAvatarImage,

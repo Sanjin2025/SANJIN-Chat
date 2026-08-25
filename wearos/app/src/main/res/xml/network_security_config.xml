@@ -11,7 +11,7 @@
     </base-config>
 
     <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">your-server.com</domain>
+        <domain includeSubdomains="true">sanjin666.dpdns.org</domain>
     </domain-config>
 
     <!-- 开发调试常用地址 -->

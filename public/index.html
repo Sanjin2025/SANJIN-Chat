@@ -370,21 +370,25 @@ a { color: var(--md-primary); text-decoration: none; }
     const tabs = $el('div', { class: 'login-tabs' });
     const bAcc = $el('button', { class: 'active' }, '账密登录');
     const bQr = $el('button', {}, '扫码登录');
+    const bOtp = $el('button', {}, '验证码');
     const bPair = $el('button', {}, '配对登录');
-    tabs.append(bAcc, bQr, bPair);
+    tabs.append(bAcc, bQr, bOtp, bPair);
     card.appendChild(tabs);
     const cd = $el('div'); card.appendChild(cd);
     function rt() {
       cd.innerHTML = '';
       bAcc.classList.toggle('active', tabMode === 'account');
       bQr.classList.toggle('active', tabMode === 'qrcode');
+      bOtp.classList.toggle('active', tabMode === 'otp');
       bPair.classList.toggle('active', tabMode === 'pair');
       if (tabMode === 'account') rAcc();
       else if (tabMode === 'qrcode') rQr();
+      else if (tabMode === 'otp') rOtp();
       else rPair();
     }
     bAcc.onclick = () => { tabMode = 'account'; rt(); };
     bQr.onclick = () => { tabMode = 'qrcode'; rt(); };
+    bOtp.onclick = () => { tabMode = 'otp'; rt(); };
     bPair.onclick = () => { tabMode = 'pair'; rt(); };
     function rAcc() {
       const uf = $el('div', { class: 'field' }); const uI = $el('input', { id: 'lu', placeholder: ' ' });
@@ -452,6 +456,59 @@ a { color: var(--md-primary); text-decoration: none; }
       }
       function stop() { if (t) { clearInterval(t); t = null; } }
       rb.onclick = gen; gen();
+    }
+    function rOtp() {
+      cd.appendChild($el('div', { class: 'text-center', style: { padding: '4px 0 12px', color: 'var(--md-on-surface-variant)', fontSize: 13 } }, '用已有用户名生成一次 6 位数字验证码完成登录。开发测试请查看服务端控制台。'));
+      const uf = $el('div', { class: 'field' });
+      const uI = $el('input', { id: 'otp-user', placeholder: ' ' });
+      uf.append(uI, $el('label', { for: 'otp-user' }, '用户名'));
+      cd.appendChild(uf);
+      const gb = $el('button', { class: 'btn btn-outline btn-block mb-16' }, '获取验证码');
+      cd.appendChild(gb);
+      const sf = $el('div', { class: 'field', style: { display: 'none' } });
+      const sI = $el('input', { id: 'otp-code', placeholder: ' ', maxlength: 6, inputmode: 'numeric', style: { fontSize: 28, fontFamily: 'monospace', textAlign: 'center', letterSpacing: 8 } });
+      sf.append(sI, $el('label', { for: 'otp-code' }, '6 位验证码'));
+      cd.appendChild(sf);
+      const tipLine = $el('div', { class: 'text-center', style: { display: 'none', fontSize: 12, color: 'var(--md-warning, #f57c00)', padding: '6px 0' } });
+      cd.appendChild(tipLine);
+      const lb = $el('button', { class: 'btn btn-filled btn-block', style: { display: 'none' } }, '登 录');
+      cd.appendChild(lb);
+      let otpId = null, countdownTimer = null;
+      gb.onclick = async () => {
+        const username = uI.value.trim();
+        if (username.length < 3) return toast('请输入用户名（≥3位）', 'error');
+        gb.disabled = true; gb.innerHTML = '<span class="loading"></span>';
+        try {
+          const r = await http('/api/otp/generate', { method: 'POST', json: { username } });
+          otpId = r.otpId;
+          sf.style.display = 'block';
+          tipLine.style.display = 'block';
+          tipLine.textContent = r.tip || '已生成验证码，有效期 3 分钟';
+          lb.style.display = 'block';
+          toast('验证码已生成', 'success');
+          // 倒计时
+          let s = 30; gb.textContent = `等待 ${s}s`;
+          countdownTimer = setInterval(() => {
+            s--; if (s <= 0) { clearInterval(countdownTimer); countdownTimer = null; gb.disabled = false; gb.textContent = '重新获取'; }
+            else gb.textContent = `等待 ${s}s`;
+          }, 1000);
+        } catch (e) {
+          toast(e.message, 'error');
+          gb.disabled = false; gb.textContent = '获取验证码';
+        }
+      };
+      lb.onclick = async () => {
+        const code = sI.value.trim();
+        if (!otpId) return toast('请先获取验证码', 'error');
+        if (!/^\d{6}$/.test(code)) return toast('请输入 6 位数字验证码', 'error');
+        lb.disabled = true; lb.innerHTML = '<span class="loading"></span>';
+        try {
+          const r = await http('/login/otp', { method: 'POST', json: { username: uI.value.trim(), otpId, code } });
+          state.token = r.token; state.me = r.user; localStorage.setItem('sanjin_token', r.token);
+          toast('登录成功', 'success'); postLoginInit();
+        } catch (e) { toast(e.message, 'error'); }
+        finally { lb.disabled = false; lb.textContent = '登 录'; }
+      };
     }
     function rPair() {
       cd.appendChild($el('div', { class: 'text-center', style: { padding: '8px 0 12px', color: 'var(--md-on-surface-variant)', fontSize: 13 } }, '在已登录设备 → 我的 → 配对设备 → 生成 6 位配对码'));
@@ -771,6 +828,8 @@ a { color: var(--md-primary); text-decoration: none; }
     list.appendChild(makeMI('🎨', '修改头像', '', openAvatarPicker));
     list.appendChild(makeMI('✏️', '修改昵称', me.nickname, openNicknameEditor));
     list.appendChild(makeMI('🔗', '配对设备', '生成6位配对码', openPairPage));
+    list.appendChild(makeMI('🪧', '加入曝光板', '展示公开资料', openEditExposure));
+    list.appendChild(makeMI('👥', '浏览曝光板', '发现新朋友', openExposureBoard));
     list.appendChild(makeMI('📢', '公告板', `${state.announcements.length} 条`, openAnnouncementBoard));
     list.appendChild(makeMI('ℹ️', '关于', state.serverInfo?.serverName || 'SanjinChat', openAboutPage));
     if (me.role === 'admin') {
@@ -1627,6 +1686,195 @@ a { color: var(--md-primary); text-decoration: none; }
       m.body.appendChild(actions);
     } catch (e) { m.body.innerHTML = `<p style="color:var(--md-error);text-align:center;padding:20px">${e.message}</p>`; }
   }
+  // ================= 曝光板功能 =================
+  /** 打开「加入/编辑曝光板」弹窗 */
+  async function openEditExposure() {
+    let m;
+    try {
+      m = makeModal({ title: '加入曝光板', width: 460, hideConfirm: true });
+      m.body.appendChild($el('p', { style: { fontSize: 13, color: 'var(--md-on-surface-variant)', margin: '0 0 12px' } }, '曝光板将展示你的公开资料（头像、昵称、用户名、简介、标签）给所有用户，包括未登录访客。加入后可随时修改或退出。'));
+
+      let meRow = { onBoard: false };
+      const statusLine = $el('div', { style: { fontSize: 13, marginBottom: 12, fontWeight: 600 } }, '正在加载我的曝光状态...');
+      m.body.appendChild(statusLine);
+
+      const bf = $el('div', { class: 'field' });
+      const bI = $el('textarea', { id: 'expo-bio', style: { minHeight: 96, resize: 'vertical' }, placeholder: ' ', maxlength: 200 });
+      bf.append(bI, $el('label', { for: 'expo-bio' }, '简介（≤200字）'));
+      m.body.appendChild(bf);
+
+      const tf = $el('div', { class: 'field' });
+      const tI = $el('input', { id: 'expo-tags', placeholder: ' ' });
+      tf.append(tI, $el('label', { for: 'expo-tags' }, '标签（用英文逗号或空格分隔，最多8个）'));
+      m.body.appendChild(tf);
+
+      const visWrap = $el('label', { style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 0' } });
+      const vI = $el('input', { id: 'expo-visible', type: 'checkbox', checked: true });
+      visWrap.append(vI, $el('span', {}, '对所有人可见'));
+      m.body.appendChild(visWrap);
+
+      // 加载我当前的状态
+      try {
+        const r = await http('/api/exposure/me'); meRow = r.data || { onBoard: false };
+        statusLine.textContent = meRow.onBoard ? '✓ 你已加入曝光板（下方可随时编辑）' : '· 你还没加入曝光板';
+        if (meRow.onBoard) {
+          bI.value = meRow.bio || '';
+          tI.value = (meRow.tags || []).join(', ');
+          vI.checked = meRow.visible !== false;
+        }
+      } catch (e) { statusLine.textContent = '加载失败: ' + e.message; }
+
+      // 底部按钮区
+      const footer = $el('div', { style: { display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' } });
+      const saveB = $el('button', { class: 'btn btn-filled', style: { flex: 1 } }, meRow.onBoard ? '保存修改' : '加入曝光板');
+      const leaveB = $el('button', { class: 'btn btn-outline', style: { flex: 1, display: meRow.onBoard ? '' : 'none' },
+                       }, '退出曝光板');
+      const cancelB = $el('button', { class: 'btn btn-ghost' }, '关闭');
+      footer.append(saveB, leaveB, cancelB);
+      m.body.appendChild(footer);
+
+      saveB.onclick = async () => {
+        saveB.disabled = true; saveB.innerHTML = '<span class="loading"></span>';
+        try {
+          const tagStr = tI.value || '';
+          const tags = tagStr.split(/[，,\s]+/).map(x => x.trim()).filter(Boolean).slice(0, 8);
+          await http('/api/exposure/upsert', {
+            method: 'POST',
+            json: {
+              bio: (bI.value || '').slice(0, 200),
+              tags,
+              visible: vI.checked,
+            },
+          });
+          toast('曝光板资料已更新', 'success');
+          m.close();
+          openExposureBoard();
+        } catch (e) { toast(e.message, 'error'); }
+        finally { saveB.disabled = false; saveB.textContent = meRow.onBoard ? '保存修改' : '加入曝光板'; }
+      };
+      leaveB.onclick = async () => {
+        if (!confirm('确定要退出曝光板吗？你的公开资料将从曝光板移除。')) return;
+        try {
+          await http('/api/exposure/leave', { method: 'POST' });
+          toast('已退出曝光板', 'success');
+          m.close();
+        } catch (e) { toast(e.message, 'error'); }
+      };
+      cancelB.onclick = () => m.close();
+    } catch (e) { if (m) m.body.innerHTML = `<p style="color:var(--md-error);text-align:center;padding:20px">${e.message}</p>`; }
+  }
+
+  /** 打开曝光板浏览页 */
+  async function openExposureBoard(filterTag) {
+    state.currentPage = 'exposure-board';
+    render();
+    const page = $el('div', { class: 'page' });
+    const title = $el('div', { class: 'page-title' }, [
+      $el('button', { class: 'icon-btn', onclick: () => { state.currentPage = 'main'; render(); } }, '←'),
+      $el('div', {}, '曝光板'),
+      $el('div', { style: { flex: 1 } }),
+    ]);
+    page.appendChild(title);
+    page.appendChild($el('p', { style: { margin: '4px 16px 12px', fontSize: 13, color: 'var(--md-on-surface-variant)' } }, '自愿加入曝光板的用户展示，欢迎互相认识 ✨'));
+
+    const bar = $el('div', { style: { display: 'flex', gap: 8, padding: '0 16px 12px', alignItems: 'center' } });
+    const searchI = $el('input', { placeholder: '按标签过滤，例如: 摄影 开发 交友' });
+    const searchB = $el('button', { class: 'btn btn-outline' }, '筛选');
+    const addB = $el('button', { class: 'btn btn-filled', style: { marginLeft: 'auto' } }, '+ 加入曝光板');
+    bar.append(searchI, searchB, addB);
+    page.appendChild(bar);
+
+    const list = $el('div', { class: 'exposure-list', style: { padding: '0 12px 120px' } });
+    page.appendChild(list);
+
+    let currentTag = filterTag || '';
+    if (currentTag) searchI.value = currentTag;
+
+    async function load(p = 1) {
+      list.innerHTML = '<div style="text-align:center;padding:24px"><span class="loading"></span></div>';
+      try {
+        const qs = new URLSearchParams({ page: String(p), pageSize: '50' });
+        if (currentTag) qs.set('tag', currentTag);
+        const r = await http('/api/exposure/list?' + qs.toString());
+        list.innerHTML = '';
+        if (!r.list || r.list.length === 0) {
+          list.appendChild($el('div', { class: 'empty-state', style: { padding: '40px 20px' } }, [
+            $el('div', { class: 'big-icon' }, '🪧'),
+            $el('p', {}, currentTag ? '没有匹配标签的用户，换个词试试？' : '曝光板暂无用户，点击「+ 加入曝光板」成为第一位吧～'),
+          ]));
+          return;
+        }
+        if (r.total > r.list.length) {
+          list.appendChild($el('div', { style: { textAlign: 'center', fontSize: 12, color: 'var(--md-on-surface-variant)', padding: '4px 0 12px' } }, `共 ${r.total} 人，显示第 ${r.page} 页（${r.pageSize}/页）`));
+        }
+        for (const it of r.list) {
+          const card = $el('div', { class: 'exposure-card',
+            style: { display: 'flex', gap: 12, padding: 12, border: '1px solid var(--md-outline-variant)', borderRadius: 16, marginBottom: 10, background: 'var(--md-surface-container-low)' } });
+          const av = $el('div', { style: { flexShrink: 0 } });
+          if (it.avatarType === 'image' && it.avatar) {
+            av.appendChild($el('img', { src: apiBase() + it.avatar, style: { width: 56, height: 56, borderRadius: '50%', objectFit: 'cover' } }));
+          } else {
+            av.appendChild($el('div', { class: 'avatar' }, it.avatarEmoji || avatarColor(it.username)));
+          }
+          const body = $el('div', { style: { flex: 1, minWidth: 0 } });
+          const nameRow = $el('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' } });
+          nameRow.append($el('div', { style: { fontSize: 16, fontWeight: 700 } }, it.nickname || it.username));
+          nameRow.append($el('div', { style: { fontSize: 12, color: 'var(--md-on-surface-variant)' } }, '@' + it.username));
+          body.appendChild(nameRow);
+          if (it.bio) body.appendChild($el('div', { style: { fontSize: 13, color: 'var(--md-on-surface-variant)', marginTop: 4, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, it.bio));
+          if (it.tags && it.tags.length) {
+            const tagRow = $el('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 } });
+            for (const t of it.tags) {
+              const tb = $el('span', { class: 'chip', style: { fontSize: 11, padding: '3px 10px', borderRadius: 999, background: 'var(--md-secondary-container)', color: 'var(--md-on-secondary-container)' } }, '#' + t);
+              tb.style.cursor = 'pointer';
+              tb.onclick = () => openExposureBoard(t);
+              tagRow.appendChild(tb);
+            }
+            body.appendChild(tagRow);
+          }
+          const actRow = $el('div', { style: { display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' } });
+          const addB2 = $el('button', { class: 'btn btn-outline', style: { fontSize: 12, padding: '6px 12px' } }, '加好友');
+          addB2.onclick = async () => {
+            const msg = prompt(`给 @${it.username} 发送好友请求（附言可选）`, `嗨，我是 @${state.me.username}，从曝光板来的～`);
+            if (msg === null) return;
+            try {
+              // 先查 userId: 搜索用户名
+              const su = await http('/search/users', { method: 'POST', json: { keyword: it.username } });
+              const u = (su.users || []).find(x => x.username === it.username);
+              if (!u) return toast('找不到该用户', 'error');
+              if (u.id === state.me.id) return toast('不能加自己', 'error');
+              wsSend({ type: 'friend_request:send', toId: u.id, message: msg });
+              toast('已发送好友请求', 'success');
+            } catch (e) { toast(e.message, 'error'); }
+          };
+          const adminBtn = state.me.role === 'admin' ? $el('button', {
+            class: 'btn btn-outline',
+            style: { fontSize: 12, padding: '6px 12px', color: 'var(--md-error)', borderColor: 'var(--md-error-container)' }
+          }, '下架') : null;
+          if (adminBtn) adminBtn.onclick = async () => {
+            const reason = prompt('下架原因（可选）', '');
+            if (reason === null) return;
+            try {
+              await http('/api/exposure/admin/remove/' + it.id, { method: 'POST', json: { reason } });
+              toast('已下架', 'success'); load(p);
+            } catch (e) { toast(e.message, 'error'); }
+          };
+          actRow.append(addB2); if (adminBtn) actRow.append(adminBtn);
+          body.appendChild(actRow);
+          card.append(av, body); list.appendChild(card);
+        }
+      } catch (e) {
+        list.innerHTML = `<p style="color:var(--md-error);text-align:center;padding:20px">加载失败: ${e.message}</p>`;
+      }
+    }
+    addB.onclick = () => openEditExposure();
+    searchB.onclick = () => { currentTag = searchI.value.trim(); load(1); };
+    searchI.addEventListener && searchI.addEventListener('keydown', (e) => { if (e.key === 'Enter') { currentTag = searchI.value.trim(); load(1); } });
+    load(1);
+
+    $('#app').appendChild(page);
+  }
+
   // 初始化
   render();
 })();

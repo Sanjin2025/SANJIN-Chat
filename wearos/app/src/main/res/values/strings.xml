@@ -10,7 +10,7 @@
     <string name="password_hint">请输入密码</string>
     <string name="nickname_hint">请输入昵称</string>
     <string name="server_address">服务器地址</string>
-    <string name="server_hint">your-server.com:8181</string>
+    <string name="server_hint">sanjin666.dpdns.org:8181</string>
     <string name="connecting">连接中...</string>
     <string name="connected">已连接</string>
     <string name="disconnected">已断开</string>

@@ -17,8 +17,11 @@ const FILES = {
   messages: 'messages.json',
   qrSessions: 'qrSessions.json',
   pairCodes: 'pairCodes.json',
+  otpSessions: 'otpSessions.json',
+  exposureBoard: 'exposureBoard.json',
   announcements: 'announcements.json',
-  serverInfo: 'serverInfo.json'
+  serverInfo: 'serverInfo.json',
+  tokens: 'tokens.json'
 };
 
 // 内存缓存，避免频繁读写文件
@@ -58,8 +61,11 @@ function getDefaultData(key) {
     groupMembers: [],
     messages: [],
     qrSessions: [],
-    pairCodes: [],
-    announcements: [],
+  pairCodes: [],
+  otpSessions: [],
+  exposureBoard: [],
+  announcements: [],
+    tokens: [],
     serverInfo: {
       serverName: 'SanjinChat',
       serverDescription: '欢迎来到 SanjinChat 聊天室',

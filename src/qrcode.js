@@ -1,5 +1,6 @@
 // ==================== 二维码登录模块 ====================
 // 生成二维码会话、查询状态、扫码确认登录
+// 客户端轮询 /api/qrcode/status/:qrSessionId，confirmed 时直接拿到 token+user
 
 const QRCode = require('qrcode');
 const storage = require('./storage');
@@ -43,10 +44,11 @@ async function generateQrSession() {
 
 /**
  * 查询二维码状态（轮询接口）
+ * confirmed 时直接生成 token、标记 used、返回 token+user（原子操作，消除竞态）
  * @param {string} qrSessionId
- * @returns {{status: string, expiresAt: number, token?: string, user?: Object}}
+ * @returns {Promise<{status: string, expiresAt: number, token?: string, user?: Object}>}
  */
-function getQrStatus(qrSessionId) {
+async function getQrStatus(qrSessionId) {
   const sessions = storage.read('qrSessions');
   const session = sessions.find(s => s.qrSessionId === qrSessionId);
 
@@ -55,42 +57,24 @@ function getQrStatus(qrSessionId) {
     return { status: 'expired', expiresAt: session ? session.expiresAt : 0 };
   }
 
-  // 如果已被确认，并且未被使用，则发放 token
   if (session.status === 'confirmed' && session.userId) {
+    // 原子发放：找到 session 后直接生成 token 并标记 used
+    // 不再依赖 server.js 二次调 consumeQrToken，消除竞态
     const user = auth.getUserById(session.userId);
-    if (user) {
-      // 生成 token，标记 used
-      // eslint-disable-next-line no-async-promise-executor
-      return { status: 'confirmed', expiresAt: session.expiresAt, _userId: session.userId, _sessionId: qrSessionId };
-    }
+    if (!user) return { status: 'expired', expiresAt: session.expiresAt };
+
+    const tokenStore = auth.tokenStore;
+    const token = 'tk_' + storage.generateId() + storage.generateId();
+    tokenStore.set(token, { userId: user.id, createdAt: now });
+
+    // 标记 used，防止重复发 token
+    session.status = 'used';
+    await storage.write('qrSessions', sessions);
+
+    return { status: 'confirmed', expiresAt: session.expiresAt, token, user };
   }
 
   return { status: session.status, expiresAt: session.expiresAt };
-}
-
-/**
- * 当状态为 confirmed 时，真正创建 token
- */
-async function consumeQrToken(qrSessionId) {
-  const sessions = storage.read('qrSessions');
-  const idx = sessions.findIndex(s => s.qrSessionId === qrSessionId);
-  if (idx === -1) throw new Error('会话不存在');
-  if (sessions[idx].status !== 'confirmed') throw new Error('会话未确认');
-  if (!sessions[idx].userId) throw new Error('会话无效');
-
-  const userId = sessions[idx].userId;
-  sessions[idx].status = 'used';
-  await storage.write('qrSessions', sessions);
-
-  const user = auth.getUserById(userId);
-  if (!user) throw new Error('用户不存在');
-
-  // 生成 token
-  const tokenStore = auth.tokenStore;
-  const token = 'tk_' + storage.generateId() + storage.generateId();
-  tokenStore.set(token, { userId, createdAt: Date.now() });
-
-  return { token, user };
 }
 
 /**
@@ -134,6 +118,5 @@ module.exports = {
   generateQrSession,
   getQrStatus,
   confirmQrLogin,
-  consumeQrToken,
   cleanupExpiredSessions
 };

@@ -16,9 +16,9 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.sanjinchat.wear.ui.screen.ChatScreen
 import com.sanjinchat.wear.ui.screen.ChatType
+import com.sanjinchat.wear.ui.screen.DpiSetupScreen
 import com.sanjinchat.wear.ui.screen.LoginScreen
 import com.sanjinchat.wear.ui.screen.MainScreen
-import com.sanjinchat.wear.ui.screen.OnboardingScreen
 import com.sanjinchat.wear.ui.theme.SanjinChatTheme
 
 class MainActivity : ComponentActivity() {
@@ -30,11 +30,12 @@ class MainActivity : ComponentActivity() {
             val dpiScale by app.preferenceManager.dpiScale.collectAsState(initial = 1.0f)
 
             SanjinChatTheme {
-                // 应用用户在 Onboarding 选的字体大小（实时刷新）
+                // 真正的应用内 DPI 切换：同时缩放 dp 与 sp
+                val baseDensity = LocalDensity.current.density
                 CompositionLocalProvider(
                     LocalDensity provides Density(
-                        density = LocalDensity.current.density,
-                        fontScale = dpiScale
+                        density = (baseDensity * dpiScale).coerceIn(0.8f, 4.5f),
+                        fontScale = dpiScale.coerceIn(0.5f, 2.0f)
                     )
                 ) {
                     SanjinChatNavHost()
@@ -54,16 +55,16 @@ fun SanjinChatNavHost() {
     val navController = rememberNavController()
     val app = SanjinChatApp.instance
 
-    val onboarded by app.preferenceManager.onboarded.collectAsState(initial = false)
     val token by app.preferenceManager.token.collectAsState(initial = null)
     val rememberLogin by app.preferenceManager.rememberLogin.collectAsState(initial = true)
+    val dpiConfigured by app.preferenceManager.dpiConfigured.collectAsState(initial = false)
 
-    // 三态入口：
-    // 1. 未完成首次设置 -> onboarding
-    // 2. 已设置 + 有缓存 token + 用户允许记住登录 -> main（自动登录）
-    // 3. 否则 -> login
+    // 入口三态：
+    // 1. 首次启动（未配置 DPI）→ dpi_setup（选择显示密度）
+    // 2. 有缓存 token + 记住登录 → main（自动登录）
+    // 3. 否则 → login
     val startDest = when {
-        !onboarded -> "onboarding"
+        !dpiConfigured -> "dpi_setup"
         rememberLogin && !token.isNullOrBlank() -> "main"
         else -> "login"
     }
@@ -72,8 +73,8 @@ fun SanjinChatNavHost() {
         navController = navController,
         startDestination = startDest
     ) {
-        composable("onboarding") {
-            OnboardingScreen(navController = navController)
+        composable("dpi_setup") {
+            DpiSetupScreen(navController = navController)
         }
 
         composable("login") {

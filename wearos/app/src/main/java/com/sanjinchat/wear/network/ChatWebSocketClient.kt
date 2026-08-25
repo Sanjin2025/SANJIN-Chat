@@ -86,7 +86,10 @@ class ChatWebSocketClient {
             }
         }
 
-    private var currentToken: String? = null
+    var currentToken: String? = null
+        private set
+
+    fun isManualDisconnect(): Boolean = manualDisconnect
 
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
@@ -106,12 +109,29 @@ class ChatWebSocketClient {
     private val _friendRequests = MutableStateFlow<List<FriendRequest>>(emptyList())
     val friendRequests: StateFlow<List<FriendRequest>> = _friendRequests.asStateFlow()
 
+    // 允许 MainScreen 在 WS 推送前，先通过 HTTP 拉取结果直接填充列表
+    fun setFriendsSnapshot(list: List<Friend>) { _friends.value = list }
+    fun setGroupsSnapshot(list: List<GroupMembership>) { _groups.value = list }
+    fun setFriendRequestsSnapshot(list: List<FriendRequest>) { _friendRequests.value = list }
+    /** HTTP fallback：WS 未连上时也能设置当前用户，供 ChatScreen 判断消息归属 */
+    fun setCurrentUser(user: User) {
+        if (_currentUser.value == null) _currentUser.value = user
+    }
+
     private var manualDisconnect = false
+    private var connectingTimeoutJob: Job? = null
 
     fun connect(token: String) {
         currentToken = token
         manualDisconnect = false
         reconnectJob?.cancel()
+        connectingTimeoutJob?.cancel()
+        // 强制关闭半死不活的旧 socket（防止 doConnect 因为 webSocket!=null 而放弃重连）
+        val oldWs = webSocket
+        if (oldWs != null) {
+            webSocket = null
+            runCatching { oldWs.close(1001, "reconnect") }
+        }
         doConnect(token)
     }
 
@@ -123,11 +143,24 @@ class ChatWebSocketClient {
         val wsUrl = buildWsUrl(token)
         val request = Request.Builder().url(wsUrl).build()
 
+        // 10s 握手超时：服务器未在 10s 内返回 connected 包 → 强制判失败 + 重连
+        connectingTimeoutJob?.cancel()
+        connectingTimeoutJob = scope.launch {
+            delay(10_000)
+            if (_connectionState.value is ConnectionState.Connecting) {
+                val wsNow = webSocket
+                webSocket = null
+                runCatching { wsNow?.close(1001, "handshake timeout") }
+                val err = "连接握手超时，正在重连…"
+                _connectionState.value = ConnectionState.Error(err)
+                runCatching { _events.emit(ChatEvent.Error(err)) }
+                if (!manualDisconnect) scheduleReconnect()
+            }
+        }
+
         webSocket = client().newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
-                scope.launch {
-                    _events.emit(ChatEvent.Error("WebSocket 已连接"))
-                }
+                // onOpen 仅代表 TCP+TLS+WS 握手完成，真正“已连接”要等服务端的 connected 包
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
@@ -147,9 +180,10 @@ class ChatWebSocketClient {
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 cleanupSocket()
+                connectingTimeoutJob?.cancel()
                 scope.launch {
                     _connectionState.value = ConnectionState.Error(t.message ?: "连接失败")
-                    _events.emit(ChatEvent.Error(t.message ?: "连接失败"))
+                    runCatching { _events.emit(ChatEvent.Error(t.message ?: "连接失败")) }
                 }
                 if (!manualDisconnect) {
                     scheduleReconnect()
@@ -204,43 +238,44 @@ class ChatWebSocketClient {
             scope.launch {
                 when (type) {
                     "connected" -> {
+                        connectingTimeoutJob?.cancel()
                         val user = parseUser(json.getJSONObject("user"))
                         _currentUser.value = user
                         _connectionState.value = ConnectionState.Connected(user)
-                        _events.emit(ChatEvent.Connected(user))
+                        runCatching { _events.emit(ChatEvent.Connected(user)) }
                     }
                     "private_message" -> {
                         val msg = parseChatMessage(json.getJSONObject("message"))
-                        _events.emit(ChatEvent.PrivateMessage(msg))
+                        runCatching { _events.emit(ChatEvent.PrivateMessage(msg)) }
                     }
                     "group_message" -> {
                         val msg = parseChatMessage(json.getJSONObject("message"))
-                        _events.emit(ChatEvent.GroupMessage(msg))
+                        runCatching { _events.emit(ChatEvent.GroupMessage(msg)) }
                     }
                     "friends:update" -> {
                         val list = parseFriends(json.getJSONArray("friends"))
                         _friends.value = list
-                        _events.emit(ChatEvent.FriendsUpdate(list))
+                        runCatching { _events.emit(ChatEvent.FriendsUpdate(list)) }
                     }
                     "groups:update" -> {
                         val list = parseGroups(json.getJSONArray("groups"))
                         _groups.value = list
-                        _events.emit(ChatEvent.GroupsUpdate(list))
+                        runCatching { _events.emit(ChatEvent.GroupsUpdate(list)) }
                     }
                     "friend_requests:update" -> {
                         val list = parseFriendRequests(json.getJSONArray("requests"))
                         _friendRequests.value = list
-                        _events.emit(ChatEvent.FriendRequestsUpdate(list))
+                        runCatching { _events.emit(ChatEvent.FriendRequestsUpdate(list)) }
                     }
                     "presence" -> {
                         val statuses = parsePresence(json.getJSONObject("statuses"))
                         updateFriendsPresence(statuses)
-                        _events.emit(ChatEvent.PresenceUpdate(statuses))
+                        runCatching { _events.emit(ChatEvent.PresenceUpdate(statuses)) }
                     }
                     "error" -> {
                         val msg = json.optString("message", "未知错误")
                         _connectionState.value = ConnectionState.Error(msg)
-                        _events.emit(ChatEvent.Error(msg))
+                        runCatching { _events.emit(ChatEvent.Error(msg)) }
                     }
                 }
             }
@@ -392,6 +427,62 @@ class ChatWebSocketClient {
         return send(msg.toString())
     }
 
+    // ===== 群管理：解散 / 踢人 / 禁言 / 解禁 / 设管理员 / 撤管理员 =====
+
+    /** 解散群（仅群主） */
+    fun dismissGroup(groupId: String): Boolean {
+        val msg = JSONObject().apply {
+            put("type", "group:dismiss")
+            put("groupId", groupId)
+        }
+        return send(msg.toString())
+    }
+
+    /** 踢人（群主 / 管理员；管理员不能踢群主和其他管理员） */
+    fun kickGroupMember(groupId: String, userId: String): Boolean {
+        val msg = JSONObject().apply {
+            put("type", "group:kick")
+            put("groupId", groupId)
+            put("userId", userId)
+        }
+        return send(msg.toString())
+    }
+
+    /** 禁言（群主 / 管理员；mutedUntil 为截止时间戳，0 表示解禁） */
+    fun muteGroupMember(groupId: String, userId: String, mutedUntil: Long): Boolean {
+        val msg = JSONObject().apply {
+            put("type", "group:mute")
+            put("groupId", groupId)
+            put("userId", userId)
+            put("mutedUntil", mutedUntil)
+        }
+        return send(msg.toString())
+    }
+
+    /** 解除禁言（内部走 mute 接口传 mutedUntil=0） */
+    fun unmuteGroupMember(groupId: String, userId: String): Boolean =
+        muteGroupMember(groupId, userId, 0L)
+
+    /** 设为管理员（仅群主） */
+    fun setGroupAdmin(groupId: String, userId: String): Boolean {
+        val msg = JSONObject().apply {
+            put("type", "group:set_admin")
+            put("groupId", groupId)
+            put("userId", userId)
+        }
+        return send(msg.toString())
+    }
+
+    /** 撤销管理员（仅群主） */
+    fun removeGroupAdmin(groupId: String, userId: String): Boolean {
+        val msg = JSONObject().apply {
+            put("type", "group:remove_admin")
+            put("groupId", groupId)
+            put("userId", userId)
+        }
+        return send(msg.toString())
+    }
+
     private fun send(text: String): Boolean {
         val ws = webSocket ?: return false
         return try {
@@ -409,6 +500,7 @@ class ChatWebSocketClient {
             avatar = json.optString("avatar"),
             avatarType = json.optString("avatarType"),
             avatarEmoji = json.optString("avatarEmoji"),
+            role = json.optString("role", "user"),
             createdAt = json.optLong("createdAt")
         )
     }
@@ -481,12 +573,12 @@ class ChatWebSocketClient {
             type = json.getString("type"),
             fromId = json.getString("fromId"),
             fromNickname = json.optString("fromNickname", ""),
-            toId = json.optString("toId"),
-            groupId = json.optString("groupId"),
+            toId = json.optString("toId").ifBlank { null },
+            groupId = json.optString("groupId").ifBlank { null },
             contentType = json.optString("contentType", "text"),
             content = json.optString("content", ""),
-            image = json.optString("image"),
-            audio = json.optString("audio"),
+            image = json.optString("image").ifBlank { null },
+            audio = json.optString("audio").ifBlank { null },
             timestamp = json.optLong("timestamp")
         )
     }

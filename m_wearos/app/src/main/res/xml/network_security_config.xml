@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 允许明文 HTTP / WebSocket (ws://) 通信。
+         同时配置 base-config + 具体 domain-config 兼容 Android 9/10/11/12+ 的优先级差异。
+         私人服务器场景，不强制 HTTPS/wss；若后续启用 HTTPS 可收紧此处。 -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">sanjin666.dpdns.org</domain>
+    </domain-config>
+
+    <!-- 开发调试常用地址 -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

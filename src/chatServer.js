@@ -23,50 +23,58 @@ class ChatServer {
    * @param {WebSocket} ws
    */
   handleConnection(ws, url) {
-    // URL 中携带 token：ws://host?token=xxx
-    let token = null;
+    // 整个连接流程外包 try/catch，避免任何同步异常导致进程崩溃
     try {
-      const queryIdx = url.indexOf('?');
-      if (queryIdx !== -1) {
-        const query = url.slice(queryIdx + 1);
-        const params = new URLSearchParams(query);
-        token = params.get('token');
+      // URL 中携带 token：ws://host?token=xxx
+      let token = null;
+      try {
+        const queryIdx = url.indexOf('?');
+        if (queryIdx !== -1) {
+          const query = url.slice(queryIdx + 1);
+          const params = new URLSearchParams(query);
+          token = params.get('token');
+        }
+      } catch (e) { /* ignore */ }
+
+      if (!token) {
+        this._sendError(ws, '缺少 token 参数');
+        ws.close();
+        return;
       }
-    } catch (e) { /* ignore */ }
 
-    if (!token) {
-      this._sendError(ws, '缺少 token 参数');
-      ws.close();
-      return;
+      const user = auth.verifyToken(token);
+      if (!user) {
+        this._sendError(ws, 'Token 无效或已过期');
+        ws.close();
+        return;
+      }
+
+      // 注册连接
+      this._registerSocket(ws, user);
+
+      // 欢迎消息
+      this._send(ws, { type: 'connected', user, timestamp: Date.now() });
+
+      // 立即推送 presence 和在线好友列表
+      this._sendPresenceToUser(user.id);
+
+      // 发送给该用户已有的所有好友和群通知（以便刷新）
+      this._sendFriendsUpdate(user.id);
+      this._sendGroupsUpdate(user.id);
+      this._sendFriendRequests(user.id);
+
+      ws.on('message', (data) => this._handleMessage(ws, data));
+      ws.on('close', () => this._handleClose(ws));
+      ws.on('error', (e) => {
+        console.error('[Chat] socket error:', e.message);
+        this._handleClose(ws);
+      });
+    } catch (err) {
+      // 任何未预期的同步异常只打印，不抛出
+      console.error('[Chat] handleConnection 出错:', err && err.message || err);
+      try { this._sendError(ws, '服务器内部错误'); } catch (_) { /* ignore */ }
+      try { ws.close(); } catch (_) { /* ignore */ }
     }
-
-    const user = auth.verifyToken(token);
-    if (!user) {
-      this._sendError(ws, 'Token 无效或已过期');
-      ws.close();
-      return;
-    }
-
-    // 注册连接
-    this._registerSocket(ws, user);
-
-    // 欢迎消息
-    this._send(ws, { type: 'connected', user, timestamp: Date.now() });
-
-    // 立即推送 presence 和在线好友列表
-    this._sendPresenceToUser(user.id);
-
-    // 发送给该用户已有的所有好友和群通知（以便刷新）
-    this._sendFriendsUpdate(user.id);
-    this._sendGroupsUpdate(user.id);
-    this._sendFriendRequests(user.id);
-
-    ws.on('message', (data) => this._handleMessage(ws, data));
-    ws.on('close', () => this._handleClose(ws));
-    ws.on('error', (e) => {
-      console.error('[Chat] socket error:', e.message);
-      this._handleClose(ws);
-    });
   }
 
   // ==================== 注册/注销 ====================
@@ -85,19 +93,24 @@ class ChatServer {
   }
 
   _handleClose(ws) {
-    const meta = this.socketMeta.get(ws);
-    if (!meta) return;
-    const { userId } = meta;
+    try {
+      const meta = this.socketMeta.get(ws);
+      if (!meta) return;
+      const { userId } = meta;
 
-    const set = this.userSockets.get(userId);
-    if (set) {
-      set.delete(ws);
-      if (set.size === 0) {
-        this.userSockets.delete(userId);
-        this._broadcastPresence(userId, 'offline');
+      const set = this.userSockets.get(userId);
+      if (set) {
+        set.delete(ws);
+        if (set.size === 0) {
+          this.userSockets.delete(userId);
+          this._broadcastPresence(userId, 'offline');
+        }
       }
+      this.socketMeta.delete(ws);
+    } catch (err) {
+      // 任何未预期的异常只打印，不向上抛（ws.on 的回调抛出会导致进程崩溃）
+      console.error('[Chat] _handleClose 出错:', err && err.message || err);
     }
-    this.socketMeta.delete(ws);
   }
 
   /**
@@ -139,8 +152,20 @@ class ChatServer {
   // ==================== 发送工具 ====================
 
   _send(ws, obj) {
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify(obj));
+    if (!ws || ws.readyState !== 1) return;
+    let data;
+    try {
+      data = JSON.stringify(obj);
+    } catch (e) {
+      // 序列化失败（如循环引用）只打印，不抛
+      console.error('[Chat] _send JSON.stringify 失败:', e.message);
+      return;
+    }
+    try {
+      ws.send(data);
+    } catch (e) {
+      // socket 已关闭/异常时 send 会抛错，吞掉避免崩溃
+      console.warn('[Chat] ws.send 失败（已忽略）:', e.message);
     }
   }
   _sendError(ws, message) {
@@ -172,10 +197,18 @@ class ChatServer {
     }
 
     try {
-      handler.call(this, user, msg, ws);
+      const ret = handler.call(this, user, msg, ws);
+      // handler 多为 async 函数，返回 Promise；同步 try/catch 抓不到 await 抛的错，
+      // 必须用 .catch() 兜底，否则会变成 unhandledRejection 导致进程崩溃。
+      if (ret && typeof ret.then === 'function') {
+        ret.catch(err => {
+          console.error('[Chat] 异步消息处理出错:', msg.type, err && err.message || err);
+          try { this._sendError(ws, err && err.message || '处理失败'); } catch (_) { /* ignore */ }
+        });
+      }
     } catch (err) {
-      console.error('[Chat] 处理消息出错:', msg.type, err.message);
-      this._sendError(ws, err.message || '处理失败');
+      console.error('[Chat] 处理消息出错:', msg.type, err && err.message || err);
+      try { this._sendError(ws, err && err.message || '处理失败'); } catch (_) { /* ignore */ }
     }
   }
 

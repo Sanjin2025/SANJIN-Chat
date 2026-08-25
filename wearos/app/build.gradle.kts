@@ -81,4 +81,7 @@ dependencies {
 
     // DataStore
     implementation("androidx.datastore:datastore-preferences:1.0.0")
+
+    // ZXing barcode scanner（扫码登录）
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 }

@@ -33,10 +33,29 @@ const auth = require('./src/auth');
 const multipart = require('./src/multipart');
 const qrcodeMod = require('./src/qrcode');
 const pairMod = require('./src/pair');
+const otpMod = require('./src/otp');
+const exposureBoardMod = require('./src/exposureBoard');
 const announcementMod = require('./src/announcement');
 const serverInfoMod = require('./src/serverInfo');
 const cleanupMod = require('./src/cleanup');
 const ChatServer = require('./src/chatServer');
+
+// ===== 全局兜底：任何未捕获的异常只打印，不退出进程 =====
+// 1) 同步未捕获异常：默认 Node 会打印并退出，这里覆盖为只打印
+process.on('uncaughtException', (err) => {
+  console.error('==================== uncaughtException ====================');
+  console.error(err && err.stack ? err.stack : err);
+  console.error('==========================================================');
+  console.error('[守护] 已捕获 uncaughtException，进程继续运行');
+});
+// 2) 未处理的 Promise rejection：高版本 Node 默认也会终止进程
+process.on('unhandledRejection', (reason) => {
+  console.error('==================== unhandledRejection ====================');
+  if (reason && reason.stack) console.error(reason.stack);
+  else console.error(reason);
+  console.error('==========================================================');
+  console.error('[守护] 已捕获 unhandledRejection，进程继续运行');
+});
 
 // ===== 服务端口 =====
 const PORT = 8181;
@@ -261,7 +280,22 @@ async function handleHttpRequest(req, res) {
       const updated = await auth.updateNickname(user.id, body.nickname);
       // 广播
       chatServer.broadcastUserNicknameUpdated(user.id, updated.nickname);
+      // 级联：曝光板快照同步
+      try { await exposureBoardMod.syncUserProfile(updated); } catch (_) {}
       return sendJson(res, 200, { ok: true, user: updated });
+    }
+
+    // 修改密码（验证旧密码）
+    if (urlPath === '/api/user/password' && req.method === 'PUT') {
+      const user = auth.verifyRequest(req);
+      if (!user) return sendJson(res, 401, { error: '未登录' });
+      const body = await readJsonBody(req);
+      try {
+        await auth.changePassword(user.id, body.oldPassword || '', body.newPassword || '');
+        return sendJson(res, 200, { ok: true });
+      } catch (e) {
+        return sendJson(res, 400, { error: e.message || '修改密码失败' });
+      }
     }
 
     if (urlPath === '/api/user' && req.method === 'DELETE') {
@@ -269,6 +303,8 @@ async function handleHttpRequest(req, res) {
       if (!user) return sendJson(res, 401, { error: '未登录' });
       const body = await readJsonBody(req);
       const result = await auth.deleteAccount(user.id, body.password);
+      // 级联：曝光板同步软删
+      try { await exposureBoardMod.handleUserDeleted(result.deletedUserId); } catch (_) {}
       // 广播
       chatServer.broadcastUserAccountDeleted(
         result.deletedUserId,
@@ -293,6 +329,8 @@ async function handleHttpRequest(req, res) {
       // 广播
       const newUser = auth.getUserById(user.id);
       chatServer.broadcastUserAvatarUpdated(user.id, newUser.avatar, newUser.avatarType, newUser.avatarEmoji);
+      // 级联：曝光板快照同步
+      try { await exposureBoardMod.syncUserProfile(newUser); } catch (_) {}
       return sendJson(res, 200, { ok: true, url: result.url });
     }
 
@@ -302,6 +340,8 @@ async function handleHttpRequest(req, res) {
       const body = await readJsonBody(req);
       const updated = await auth.setAvatarEmoji(user.id, body.emoji);
       chatServer.broadcastUserAvatarUpdated(user.id, updated.avatar, updated.avatarType, updated.avatarEmoji);
+      // 级联：曝光板快照同步
+      try { await exposureBoardMod.syncUserProfile(updated); } catch (_) {}
       return sendJson(res, 200, { ok: true, avatar: updated.avatarEmoji });
     }
 
@@ -313,15 +353,10 @@ async function handleHttpRequest(req, res) {
 
     const qrStatusParam = matchPath('/api/qrcode/status/:qrSessionId', urlPath);
     if (qrStatusParam && req.method === 'GET') {
-      const status = qrcodeMod.getQrStatus(qrStatusParam.qrSessionId);
-      // 如果 confirmed，发放 token
-      if (status.status === 'confirmed' && status._userId) {
-        try {
-          const result = await qrcodeMod.consumeQrToken(qrStatusParam.qrSessionId);
-          return sendJson(res, 200, { ok: true, status: 'confirmed', token: result.token, user: result.user });
-        } catch (e) {
-          return sendJson(res, 200, { ok: true, status: 'expired' });
-        }
+      // getQrStatus 现在是 async，且 confirmed 时直接返回 token+user（原子发放，不再二次调 consume）
+      const status = await qrcodeMod.getQrStatus(qrStatusParam.qrSessionId);
+      if (status.status === 'confirmed' && status.token) {
+        return sendJson(res, 200, { ok: true, status: 'confirmed', token: status.token, user: status.user });
       }
       return sendJson(res, 200, { ok: true, status: status.status, expiresAt: status.expiresAt });
     }
@@ -331,6 +366,55 @@ async function handleHttpRequest(req, res) {
       const authHeader = req.headers['authorization'] || '';
       const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : (body.token || '');
       const result = await qrcodeMod.confirmQrLogin(body.qrSessionId, token);
+      return sendJson(res, 200, result);
+    }
+
+    // ====== 验证码登录 ======
+    if (urlPath === '/api/otp/generate' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const result = await otpMod.generate(body.username);
+      return sendJson(res, 200, result);
+    }
+    // OTP 登录：路由从 /login/otp 改为 /api/otp/login，且只传 username + code（不要 otpId）
+    if (urlPath === '/api/otp/login' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const result = await otpMod.login(body.username, body.code);
+      return sendJson(res, 200, result);
+    }
+
+    // ====== 曝光板 ======
+    if (urlPath === '/api/exposure/list' && req.method === 'GET') {
+      const tagMatch = matchPath('/api/exposure/list/:tag', urlPath);
+      const urlObj = new URL(req.url, 'http://x');
+      const tagParam = tagMatch ? tagMatch.tag : (urlObj.searchParams.get('tag') || '');
+      const page = parseInt(urlObj.searchParams.get('page') || '1', 10);
+      const pageSize = parseInt(urlObj.searchParams.get('pageSize') || '20', 10);
+      return sendJson(res, 200, { ok: true, ...exposureBoardMod.listExposure({ tag: tagParam, page, pageSize }) });
+    }
+    if (urlPath === '/api/exposure/mine' && req.method === 'GET') {
+      const user = auth.verifyRequest(req);
+      if (!user) return sendJson(res, 401, { error: '未登录' });
+      return sendJson(res, 200, { ok: true, ...exposureBoardMod.getMyExposure(user.id) });
+    }
+    if (urlPath === '/api/exposure/upsert' && req.method === 'POST') {
+      const user = auth.verifyRequest(req);
+      if (!user) return sendJson(res, 401, { error: '未登录' });
+      const body = await readJsonBody(req);
+      const result = await exposureBoardMod.upsertExposure(user, body);
+      return sendJson(res, 200, { ok: true, ...result });
+    }
+    if (urlPath === '/api/exposure/leave' && req.method === 'POST') {
+      const user = auth.verifyRequest(req);
+      if (!user) return sendJson(res, 401, { error: '未登录' });
+      const result = await exposureBoardMod.leaveExposure(user.id);
+      return sendJson(res, 200, result);
+    }
+    const adminRemoveMatch = matchPath('/api/exposure/admin/remove/:id', urlPath);
+    if (adminRemoveMatch && req.method === 'POST') {
+      const user = auth.verifyRequest(req);
+      if (!user) return sendJson(res, 401, { error: '未登录' });
+      const body = await readJsonBody(req);
+      const result = await exposureBoardMod.adminRemove(user, adminRemoveMatch.id, body.reason);
       return sendJson(res, 200, result);
     }
 
@@ -376,6 +460,13 @@ async function handleHttpRequest(req, res) {
     }
 
     // ====== 搜索 ======
+    // ====== 获取当前登录用户资料（WS 未连上时的 fallback） ======
+    if (urlPath === '/api/user/me' && req.method === 'GET') {
+      const user = auth.verifyRequest(req);
+      if (!user) return sendJson(res, 401, { error: '未登录' });
+      return sendJson(res, 200, { ok: true, user: auth.sanitizeUser(user) });
+    }
+
     if (urlPath === '/search/users' && req.method === 'POST') {
       const user = auth.verifyRequest(req);
       if (!user) return sendJson(res, 401, { error: '未登录' });
@@ -484,6 +575,33 @@ async function handleHttpRequest(req, res) {
     }
 
     // ====== 消息列表 ======
+
+    // 云端同步：返回当前用户 10 天内参与的所有私聊/群聊消息
+    if (urlPath === '/api/messages/sync' && req.method === 'GET') {
+      const user = auth.verifyRequest(req);
+      if (!user) return sendJson(res, 401, { error: '未登录' });
+      const cutoff = Date.now() - 10 * 24 * 60 * 60 * 1000;
+      const messages = storage.read('messages');
+      // 用户所在群列表
+      const groupMembers = storage.read('groupMembers');
+      const myGroupIds = new Set(
+        groupMembers.filter(gm => gm.userId === user.id).map(gm => gm.groupId)
+      );
+      const list = messages
+        .filter(m => m.timestamp >= cutoff)
+        .filter(m => {
+          if (m.type === 'private_message') {
+            return m.fromId === user.id || m.toId === user.id;
+          }
+          if (m.type === 'group_message') {
+            return m.groupId && myGroupIds.has(m.groupId);
+          }
+          return false;
+        })
+        .sort((a, b) => a.timestamp - b.timestamp);
+      return sendJson(res, 200, { ok: true, messages: list });
+    }
+
     if (urlPath === '/messages/private/:friendId' && req.method === 'GET') {
       const user = auth.verifyRequest(req);
       if (!user) return sendJson(res, 401, { error: '未登录' });
@@ -674,13 +792,34 @@ async function bootstrap() {
   // 4. 挂载 WebSocket 服务器（挂到 HTTPS 服务器即为 wss://）
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
   wss.on('connection', (ws, req) => {
-    chatServer.handleConnection(ws, req.url || '');
+    try {
+      chatServer.handleConnection(ws, req.url || '');
+    } catch (err) {
+      // 兜底：handleConnection 内部已有 try/catch，但再保一层
+      console.error('[HTTP] wss connection 异常:', err && err.message || err);
+      try { ws.close(); } catch (_) { /* ignore */ }
+    }
+  });
+  wss.on('error', (err) => {
+    console.error('[HTTP] WebSocketServer error:', err && err.message || err);
   });
 
   // 5. 启动定时清理
   cleanupMod.scheduleDailyCleanup();
 
   // 6. 启动服务
+  httpServer.on('error', (err) => {
+    // 监听错误（端口冲突等）只打印，不退出
+    console.error('==================== httpServer error ====================');
+    if (err && err.code === 'EADDRINUSE') {
+      console.error(`[启动] 端口 ${PORT} 已被占用`);
+    } else if (err && err.code === 'EACCES') {
+      console.error(`[启动] 无权限监听端口 ${PORT}（<1024 需要 root/管理员）`);
+    }
+    console.error(err && err.stack ? err.stack : err);
+    console.error('==========================================================');
+    console.error('[守护] httpServer 异常已记录，进程继续运行');
+  });
   httpServer.listen(PORT, () => {
     console.log(`[启动] 服务启动成功: ${scheme}://localhost:${PORT}`);
     console.log(`[启动] WebSocket: ${wsScheme}://localhost:${PORT}/ws`);
@@ -694,6 +833,9 @@ async function bootstrap() {
 }
 
 bootstrap().catch(err => {
-  console.error('启动失败:', err);
-  process.exit(1);
+  // 启动失败：只打印，不退出进程，让用户能看日志
+  console.error('==================== bootstrap 失败 ====================');
+  console.error(err && err.stack ? err.stack : err);
+  console.error('=======================================================');
+  console.error('[守护] 启动失败，进程不退出（避免脚本闪退看不清错误）');
 });

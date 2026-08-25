@@ -122,11 +122,12 @@ function getPairStatus(token) {
   );
 
   if (!rec) {
-    return { pairCode: null, expiresAt: 0, status: 'none' };
+    return { pairCode: null, expiresAt: 0, expiresIn: 0, status: 'none' };
   }
   return {
     pairCode: rec.pairCode,
     expiresAt: rec.expiresAt,
+    expiresIn: Math.max(0, Math.floor((rec.expiresAt - now) / 1000)),
     status: rec.status
   };
 }
