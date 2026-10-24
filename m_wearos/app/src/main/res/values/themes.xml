@@ -1,8 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <style name="Theme.SanjinChat" parent="@android:style/Theme.DeviceDefault">
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+        去掉系统自动生成的"三金聊天"标题 ActionBar + 全面启用手机/Wear 通用 UI：
+        - parent = DeviceDefault.NoActionBar：无系统标题栏，由 Compose 绘制全部 UI（截图顶部"三金聊天"会消失）。
+        - 状态栏/导航栏透明 + windowDrawsSystemBarBackgrounds：让我们 PredictiveBackScaffold 的背景层和页面内容延伸到状态栏/导航栏，实现全屏幕沉浸式效果。
+        - enforceStatusBar/NavigationBarContrast = false：透明导航栏/状态栏时不强制加系统保护色（MD3 沉浸式体验）。
+        - android:enableOnBackInvokedCallback：Android 13+ 系统 Predictive Back（与我们自定义 PredictiveBackScaffold 并存）。
+    -->
+    <style name="Theme.SanjinChat" parent="@android:style/Theme.DeviceDefault.NoActionBar">
         <item name="android:windowBackground">@color/background</item>
-        <item name="android:statusBarColor">@color/background</item>
-        <item name="android:navigationBarColor">@color/background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+
+        <!-- 系统级 Predictive Back（Android 13+ 手机手势导航 / Wear OS 系统返回动画） -->
+        <item name="android:enableOnBackInvokedCallback" tools:targetApi="33">true</item>
     </style>
 </resources>

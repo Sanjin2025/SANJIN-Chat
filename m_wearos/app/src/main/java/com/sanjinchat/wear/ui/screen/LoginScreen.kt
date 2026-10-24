@@ -23,14 +23,18 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -74,9 +78,12 @@ import com.sanjinchat.wear.network.ApiClient
 import com.sanjinchat.wear.ui.theme.ErrorDeep
 import com.sanjinchat.wear.ui.theme.ErrorLight
 import com.sanjinchat.wear.ui.theme.ExpressiveMotion
+import com.sanjinchat.wear.network.ConnectionState
 import com.sanjinchat.wear.ui.theme.OnSurfaceVariant
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 
 enum class LoginMode { LOGIN, REGISTER, PAIR, QR, OTP }
 
@@ -96,8 +103,8 @@ fun LoginScreen(navController: NavController) {
     var otpCountdown by remember { mutableStateOf(0) }
     var otpGenLoading by remember { mutableStateOf(false) }
     var otpError by remember { mutableStateOf<String?>(null) }
-    val serverAddress = "sanjin666.dpdns.org:8181"
-    val protocol = "ws"
+    var serverAddress by remember { mutableStateOf("sanjinx.com") }
+    var protocol by remember { mutableStateOf("ws") }
     var rememberLogin by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
@@ -109,10 +116,20 @@ fun LoginScreen(navController: NavController) {
             otpUsername = savedUser
         }
         app.preferenceManager.rememberLogin.first().let { rememberLogin = it }
+        // 读取保存的服务器地址（高级设置里改的），默认 sanjinx.com
+        val savedAddr = app.preferenceManager.serverAddress.first()
+        val savedProto = app.preferenceManager.serverProtocol.first()
+        serverAddress = savedAddr.ifBlank { "sanjinx.com" }
+        protocol = savedProto.ifBlank { "ws" }
         app.apiClient.serverAddress = serverAddress
         app.apiClient.serverProtocol = protocol
         app.webSocketClient.serverAddress = serverAddress
         app.webSocketClient.serverProtocol = protocol
+        // 自动登录（cookie 恢复）失败时的提示，例如"登录已过期，请重新登录"；只显示一次
+        app.pendingLoginNotice?.let { notice ->
+            errorMessage = notice
+            app.pendingLoginNotice = null
+        }
     }
 
     LaunchedEffect(otpInfo) {
@@ -146,10 +163,15 @@ fun LoginScreen(navController: NavController) {
         label = "loginBtnScale"
     )
 
+    val statusPad = WindowInsets.statusBars.asPaddingValues()
+    val navPad = WindowInsets.navigationBars.asPaddingValues()
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .padding(top = statusPad.calculateTopPadding())
+            .padding(bottom = navPad.calculateBottomPadding())
     ) {
         Column(
             modifier = Modifier
@@ -162,7 +184,13 @@ fun LoginScreen(navController: NavController) {
                 text = "三金聊天",
                 color = MaterialTheme.colorScheme.primary,
                 fontWeight = FontWeight.Bold,
-                fontSize = if (isRound) 15.sp else 18.sp
+                fontSize = if (isRound) 15.sp else 18.sp,
+                modifier = Modifier.animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                )
             )
             Text(
                 text = "Android Wear / 手机通用版",
@@ -209,32 +237,32 @@ fun LoginScreen(navController: NavController) {
             }
             Spacer(modifier = Modifier.height(4.dp))
 
-            // ===== Expressive 动效：登录模式切换 =====
+            // ===== Expressive 动效：登录模式切换（手机大屏更明显版本） =====
             AnimatedContent(
                 targetState = mode,
                 transitionSpec = {
                     (slideInHorizontally(
-                        animationSpec = tween(350, easing = ExpressiveMotion.EmphasizedEasing),
-                        initialOffsetX = { it / 3 }
+                        animationSpec = tween(450, easing = ExpressiveMotion.EmphasizedEasing),
+                        initialOffsetX = { it / 2 }
                     ) +
-                        fadeIn(tween(300, easing = ExpressiveMotion.EmphasizedDecelerate)) +
+                        fadeIn(tween(380, easing = ExpressiveMotion.EmphasizedDecelerate)) +
                         scaleIn(
-                            initialScale = 0.92f,
+                            initialScale = 0.88f,
                             animationSpec = spring(
-                                dampingRatio = 0.8f,
+                                dampingRatio = 0.75f,
                                 stiffness = Spring.StiffnessMediumLow
                             )
                         )) togetherWith
                     (slideOutHorizontally(
-                        animationSpec = tween(220, easing = ExpressiveMotion.EmphasizedAccelerate),
-                        targetOffsetX = { -it / 3 }
+                        animationSpec = tween(260, easing = ExpressiveMotion.EmphasizedAccelerate),
+                        targetOffsetX = { -it / 2 }
                     ) +
-                        fadeOut(tween(180)) +
+                        fadeOut(tween(200)) +
                         scaleOut(
-                            targetScale = 0.96f,
+                            targetScale = 0.92f,
                             animationSpec = spring(
                                 dampingRatio = 0.85f,
-                                stiffness = Spring.StiffnessMedium
+                                stiffness = Spring.StiffnessMediumLow
                             )
                         ))
                 },
@@ -278,9 +306,24 @@ fun LoginScreen(navController: NavController) {
                                     app.preferenceManager.saveLoginInfo(
                                         token, user.id, user.username, user.nickname
                                     )
-                                    app.webSocketClient.connect(token)
-                                    navController.navigate("main") {
-                                        popUpTo("login") { inclusive = true }
+                                    runCatching { app.webSocketClient.connect(token) }
+                                        .onFailure { e ->
+                                            errorMessage = "WebSocket：${e.message}"
+                                            return@launch
+                                        }
+                                    val state = withTimeoutOrNull(15_000) {
+                                        app.webSocketClient.connectionState.first { s ->
+                                            s is ConnectionState.Connected || s is ConnectionState.Error
+                                        }
+                                    }
+                                    when (state) {
+                                        is ConnectionState.Connected ->
+                                            navController.navigate("boot") {
+                                                popUpTo("login") { inclusive = true }
+                                            }
+                                        is ConnectionState.Error ->
+                                            errorMessage = state.message.ifBlank { "连接失败，请重试" }
+                                        else -> errorMessage = "连接超时（15s），请检查服务器或重试"
                                     }
                                 }
                             },
@@ -412,9 +455,23 @@ fun LoginScreen(navController: NavController) {
                                                 token, user.id, user.username, user.nickname
                                             )
                                             runCatching { app.webSocketClient.connect(token) }
-                                                .onFailure { e -> errorMessage = "WebSocket：${e.message}" }
-                                            navController.navigate("main") {
-                                                popUpTo("login") { inclusive = true }
+                                                .onFailure { e ->
+                                                    errorMessage = "WebSocket：${e.message}"
+                                                    return@fold
+                                                }
+                                            val state = withTimeoutOrNull(15_000) {
+                                                app.webSocketClient.connectionState.first { s ->
+                                                    s is ConnectionState.Connected || s is ConnectionState.Error
+                                                }
+                                            }
+                                            when (state) {
+                                                is ConnectionState.Connected ->
+                                                    navController.navigate("main") {
+                                                        popUpTo("login") { inclusive = true }
+                                                    }
+                                                is ConnectionState.Error ->
+                                                    errorMessage = state.message.ifBlank { "连接失败，请重试" }
+                                                else -> errorMessage = "连接超时（15s），请检查服务器或重试"
                                             }
                                         },
                                         onFailure = { e -> errorMessage = e.message ?: "登录失败" }
@@ -435,9 +492,23 @@ fun LoginScreen(navController: NavController) {
                                                         token, user.id, user.username, user.nickname
                                                     )
                                                     runCatching { app.webSocketClient.connect(token) }
-                                                        .onFailure { e -> errorMessage = "WebSocket：${e.message}" }
-                                                    navController.navigate("main") {
-                                                        popUpTo("login") { inclusive = true }
+                                                        .onFailure { e ->
+                                                            errorMessage = "WebSocket：${e.message}"
+                                                            return@fold
+                                                        }
+                                                    val state = withTimeoutOrNull(15_000) {
+                                                        app.webSocketClient.connectionState.first { s ->
+                                                            s is ConnectionState.Connected || s is ConnectionState.Error
+                                                        }
+                                                    }
+                                                    when (state) {
+                                                        is ConnectionState.Connected ->
+                                                            navController.navigate("main") {
+                                                                popUpTo("login") { inclusive = true }
+                                                            }
+                                                        is ConnectionState.Error ->
+                                                            errorMessage = state.message.ifBlank { "连接失败，请重试" }
+                                                        else -> errorMessage = "连接超时（15s），请检查服务器或重试"
                                                     }
                                                 },
                                                 onFailure = { e -> errorMessage = e.message ?: "登录失败" }
@@ -459,9 +530,23 @@ fun LoginScreen(navController: NavController) {
                                                 token, user.id, user.username, user.nickname
                                             )
                                             runCatching { app.webSocketClient.connect(token) }
-                                                .onFailure { e -> errorMessage = "WebSocket：${e.message}" }
-                                            navController.navigate("main") {
-                                                popUpTo("login") { inclusive = true }
+                                                .onFailure { e ->
+                                                    errorMessage = "WebSocket：${e.message}"
+                                                    return@fold
+                                                }
+                                            val state = withTimeoutOrNull(15_000) {
+                                                app.webSocketClient.connectionState.first { s ->
+                                                    s is ConnectionState.Connected || s is ConnectionState.Error
+                                                }
+                                            }
+                                            when (state) {
+                                                is ConnectionState.Connected ->
+                                                    navController.navigate("main") {
+                                                        popUpTo("login") { inclusive = true }
+                                                    }
+                                                is ConnectionState.Error ->
+                                                    errorMessage = state.message.ifBlank { "连接失败，请重试" }
+                                                else -> errorMessage = "连接超时（15s），请检查服务器或重试"
                                             }
                                         },
                                         onFailure = { e -> errorMessage = e.message ?: "配对码登录失败" }
@@ -480,9 +565,23 @@ fun LoginScreen(navController: NavController) {
                                                 token, user.id, user.username, user.nickname
                                             )
                                             runCatching { app.webSocketClient.connect(token) }
-                                                .onFailure { e -> errorMessage = "WebSocket：${e.message}" }
-                                            navController.navigate("main") {
-                                                popUpTo("login") { inclusive = true }
+                                                .onFailure { e ->
+                                                    errorMessage = "WebSocket：${e.message}"
+                                                    return@fold
+                                                }
+                                            val state = withTimeoutOrNull(15_000) {
+                                                app.webSocketClient.connectionState.first { s ->
+                                                    s is ConnectionState.Connected || s is ConnectionState.Error
+                                                }
+                                            }
+                                            when (state) {
+                                                is ConnectionState.Connected ->
+                                                    navController.navigate("main") {
+                                                        popUpTo("login") { inclusive = true }
+                                                    }
+                                                is ConnectionState.Error ->
+                                                    errorMessage = state.message.ifBlank { "连接失败，请重试" }
+                                                else -> errorMessage = "连接超时（15s），请检查服务器或重试"
                                             }
                                         },
                                         onFailure = { e -> errorMessage = e.message ?: "验证码登录失败" }
@@ -561,20 +660,36 @@ private fun ModeChip(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.94f else 1f,
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessHigh),
+        label = "modeChip_$label"
+    )
     FilterChip(
         selected = selected,
         onClick = onClick,
+        interactionSource = interaction,
         label = {
             Text(
                 label,
                 fontSize = 10.sp,
-                modifier = Modifier.padding(horizontal = 4.dp, vertical = 0.dp)
+                modifier = Modifier
+                    .padding(horizontal = 4.dp, vertical = 0.dp)
+                    .animateContentSize(
+                        animationSpec = spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow)
+                    )
             )
         },
         modifier = modifier
             .clip(RoundedCornerShape(14.dp))
             .height(30.dp)
-            .padding(horizontal = 2.dp, vertical = 2.dp),
+            .padding(horizontal = 2.dp, vertical = 2.dp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            },
         colors = if (selected) {
             FilterChipDefaults.filterChipColors(
                 containerColor = MaterialTheme.colorScheme.primary,
@@ -603,7 +718,14 @@ private fun LoginForm(
             value = username,
             onValueChange = onUsernameChange,
             label = { Text("用户名", fontSize = 11.sp) },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ),
             singleLine = true
         )
         Spacer(modifier = Modifier.height(5.dp))
@@ -611,7 +733,14 @@ private fun LoginForm(
             value = password,
             onValueChange = onPasswordChange,
             label = { Text("密码", fontSize = 11.sp) },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ),
             singleLine = true,
             visualTransformation = PasswordVisualTransformation()
         )
@@ -632,7 +761,14 @@ private fun RegisterForm(
             value = username,
             onValueChange = onUsernameChange,
             label = { Text("用户名", fontSize = 11.sp) },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ),
             singleLine = true
         )
         Spacer(modifier = Modifier.height(4.dp))
@@ -640,7 +776,14 @@ private fun RegisterForm(
             value = nickname,
             onValueChange = onNicknameChange,
             label = { Text("昵称", fontSize = 11.sp) },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ),
             singleLine = true
         )
         Spacer(modifier = Modifier.height(4.dp))
@@ -648,7 +791,14 @@ private fun RegisterForm(
             value = password,
             onValueChange = onPasswordChange,
             label = { Text("密码", fontSize = 11.sp) },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ),
             singleLine = true,
             visualTransformation = PasswordVisualTransformation()
         )
@@ -665,7 +815,14 @@ private fun PairForm(
             value = pairCode,
             onValueChange = { onPairCodeChange(it.uppercase()) },
             label = { Text("配对码", fontSize = 10.sp) },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ),
             singleLine = true,
             textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp),
             placeholder = { Text("6位配对码", color = Color.Gray, fontSize = 10.sp) }
@@ -696,13 +853,27 @@ private fun OtpForm(
             value = otpUsername,
             onValueChange = onUsernameChange,
             label = { Text("用户名", fontSize = 10.sp) },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ),
             singleLine = true,
             textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp)
         )
         Spacer(modifier = Modifier.height(4.dp))
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ),
             horizontalArrangement = Arrangement.spacedBy(4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -857,7 +1028,14 @@ private fun QrForm(
                 text = tipText,
                 color = if (s is ApiClient.QrPoll.Expired) ErrorLight else OnSurfaceVariant,
                 fontSize = 9.sp,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ),
                 textAlign = TextAlign.Center
             )
         }
@@ -868,7 +1046,14 @@ private fun QrForm(
         Spacer(modifier = Modifier.height(4.dp))
         Button(
             onClick = { regenerate() },
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .animateContentSize(
+                    animationSpec = spring(
+                        dampingRatio = 0.82f,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                ),
             contentPadding = PaddingValues(vertical = 2.dp)
         ) { Text("刷新二维码", fontSize = 10.sp) }
     }

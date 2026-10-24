@@ -27,11 +27,15 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -51,6 +55,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -86,6 +91,7 @@ import com.sanjinchat.wear.ui.theme.PurpleDeep
 import com.sanjinchat.wear.ui.theme.PurpleLight
 import com.sanjinchat.wear.ui.theme.SurfaceVariant
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -136,6 +142,164 @@ fun ChatScreen(
     var messageInput by remember { mutableStateOf("") }
     var sendingError by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
+    // 待回显的本地乐观消息映射：key = 本地消息 id("local_...") → 超时 Job
+    val pendingLocalIds = remember { mutableStateMapOf<String, Job>() }
+
+    /** 内容等价判断：语音/图片按前缀（服务端与本地秒数可能有细微差异），文本全等 */
+    fun contentEquivalent(contentType: String, localContent: String, serverContent: String): Boolean =
+        when (contentType) {
+            "audio" -> localContent.startsWith("[语音") && serverContent.startsWith("[语音")
+            "image" -> localContent.startsWith("[图片") && serverContent.startsWith("[图片")
+            else -> localContent == serverContent
+        }
+
+    /**
+     * 该服务器消息是否为我发出的（用于回显判定）。
+     *
+     * 修复"消息出现两条（刚刚发的 + 缓存/回显）"的关键：
+     * 之前用 `msg.fromId == currentUser?.id` 判断 isMyEcho，而杀后台/冷启动后 currentUser 可能还没恢复
+     * （发送时 fromId 甚至被写成了 ""），isMyEcho 恒为 false → 乐观消息永远删不掉 → 出现两条。
+     * 现在私聊改为按会话结构判断：发往当前好友的消息必然是我发的，完全不依赖 currentUser。
+     */
+    fun isMyOutgoing(serverMsg: com.sanjinchat.wear.model.ChatMessage): Boolean =
+        when (chatType) {
+            is ChatType.Private -> serverMsg.toId == chatType.friendId
+            is ChatType.Group -> {
+                val me = currentUser?.id
+                !me.isNullOrBlank() && serverMsg.groupId == chatType.groupId && serverMsg.fromId == me
+            }
+        }
+
+    /**
+     * 回显匹配并移除对应的乐观消息，返回是否命中。
+     * @param allowLooseFallback 仅当能确认这条消息是我发的时才允许走"删最早 pending"兜底，
+     *        避免对方新消息误删我的乐观消息
+     */
+    fun removeMatchingLocalEcho(
+        serverMsg: com.sanjinchat.wear.model.ChatMessage,
+        allowLooseFallback: Boolean
+    ): Boolean {
+        // 第 1 层：内容指纹 + 同会话目标 + 60s 窗口
+        val idx = messages.indexOfFirst { local ->
+            local.id.startsWith("local_") &&
+                local.contentType == serverMsg.contentType &&
+                contentEquivalent(serverMsg.contentType, local.content, serverMsg.content) &&
+                local.toId == serverMsg.toId &&
+                local.groupId == serverMsg.groupId &&
+                kotlin.math.abs(local.timestamp - serverMsg.timestamp) < 60_000
+        }
+        if (idx >= 0) {
+            val removed = messages.removeAt(idx)
+            pendingLocalIds.remove(removed.id)?.cancel()
+            return true
+        }
+
+        // 第 2 层：同 contentType + 同会话目标，时间窗口放宽到 90s
+        val looseIdx = messages.indexOfFirst { local ->
+            local.id.startsWith("local_") &&
+                local.contentType == serverMsg.contentType &&
+                local.toId == serverMsg.toId &&
+                local.groupId == serverMsg.groupId &&
+                kotlin.math.abs(local.timestamp - serverMsg.timestamp) < 90_000
+        }
+        if (looseIdx >= 0) {
+            val removed = messages.removeAt(looseIdx)
+            pendingLocalIds.remove(removed.id)?.cancel()
+            return true
+        }
+
+        // 第 3 层兜底（仅限确认是我发的）：把最早那条待回显的乐观消息删掉
+        if (allowLooseFallback) {
+            val oldest = pendingLocalIds.keys.firstOrNull()
+            if (oldest != null) {
+                val i = messages.indexOfFirst { it.id == oldest }
+                if (i >= 0) messages.removeAt(i)
+                pendingLocalIds.remove(oldest)?.cancel()
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * 最终折叠：把"未确认的乐观消息"与"已落地的同内容服务端消息"收敛成一条。
+     * 作为兜底，保证任何漏网路径都不会在界面上留下两条相同消息。
+     */
+    fun collapseEchoDuplicates() {
+        val remote = messages.filter { !it.id.startsWith("local_") }
+        if (remote.isEmpty()) return
+        val duplicates = messages.filter { local ->
+            local.id.startsWith("local_") && remote.any { server ->
+                server.contentType == local.contentType &&
+                    contentEquivalent(server.contentType, local.content, server.content) &&
+                    server.toId == local.toId &&
+                    server.groupId == local.groupId &&
+                    kotlin.math.abs(server.timestamp - local.timestamp) < 90_000
+            }
+        }
+        duplicates.forEach { local ->
+            messages.remove(local)
+            pendingLocalIds.remove(local.id)?.cancel()
+        }
+    }
+
+    /**
+     * 添加乐观消息：防抖 + 8s 回显超时清理；**不写入持久化 cache**（只存服务器真实消息）
+     */
+    fun addOptimisticMsg(
+        type: String,
+        fromId: String,
+        fromNickname: String,
+        toId: String?,
+        groupId: String?,
+        contentType: String,
+        content: String,
+        image: String? = null,
+        audio: String? = null
+    ) {
+        val now = System.currentTimeMillis()
+        // 防抖：2s 内同 contentType + 同 content + 同目标 已经有 local_，不重复插入
+        val duplicate = messages.any { m ->
+            m.id.startsWith("local_") &&
+            m.contentType == contentType &&
+            m.content == content &&
+            m.toId == toId && m.groupId == groupId &&
+            (now - m.timestamp) < 2000
+        }
+        if (duplicate) return
+        val id = "local_${now}_${kotlin.random.Random.nextInt(1000, 9999)}"
+        val localMsg = com.sanjinchat.wear.model.ChatMessage(
+            id = id,
+            type = type,
+            fromId = fromId,
+            fromNickname = fromNickname,
+            toId = toId,
+            groupId = groupId,
+            contentType = contentType,
+            content = content,
+            image = image,
+            audio = audio,
+            timestamp = now
+        )
+        messages.add(localMsg)
+        scope.launch { runCatching { listState.animateScrollToItem(messages.size - 1) } }
+
+        // 8s 超时：如果还没收到回显，说明 server 没收到 → 直接删掉乐观，提示用户
+        val timeoutJob = scope.launch {
+            kotlinx.coroutines.delay(8000)
+            if (messages.remove(localMsg)) {
+                sendingError = "发送未确认，请检查网络并重试"
+            }
+            pendingLocalIds.remove(id)
+        }
+        pendingLocalIds[id] = timeoutJob
+    }
+
+    /** 发送失败：把刚插入的乐观消息删掉并标错 */
+    fun dropOptimisticForSendFail(localId: String) {
+        messages.removeAll { it.id == localId }
+        pendingLocalIds.remove(localId)?.cancel()
+    }
 
     val savedUserId = remember { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) {
@@ -174,6 +338,9 @@ fun ChatScreen(
 
     var historyLoaded by remember(chatType) { mutableStateOf(false) }
     LaunchedEffect(chatType) {
+        // 切会话：先取消所有待回显的超时 Job，并清空集合
+        pendingLocalIds.values.forEach { runCatching { it.cancel() } }
+        pendingLocalIds.clear()
         messages.clear()
         historyLoaded = false
 
@@ -183,8 +350,12 @@ fun ChatScreen(
         }
 
         val cached = app.messageCache.getMessages(convId)
+            // 防止之前版本把 local_ 乐观消息持久化进 cache，加载时全部过滤掉，避免显示 2 条
+            .filter { !it.id.startsWith("local_") }
         if (cached.isNotEmpty()) {
             messages.addAll(cached)
+            // 兜底：cache 里已经有同内容的服务端消息时，把还没确认的乐观副本折叠掉
+            collapseEchoDuplicates()
             runCatching { listState.animateScrollToItem(messages.size - 1) }
         }
 
@@ -203,6 +374,7 @@ fun ChatScreen(
                     }
                 }
                 messages.sortBy { it.timestamp }
+                collapseEchoDuplicates()
                 app.messageCache.saveMessages(convId, list)
                 if (messages.isNotEmpty()) runCatching { listState.animateScrollToItem(messages.size - 1) }
             }
@@ -223,28 +395,20 @@ fun ChatScreen(
                             is ChatEvent.PrivateMessage -> {
                                 if (chatType is ChatType.Private) {
                                     val msg = event.message
-                                    val cu = currentUser?.id
-                                    val isMyEcho = cu != null && msg.fromId == cu
-                                    val isRelevant = if (cu != null) {
-                                        (msg.fromId == chatType.friendId && msg.toId == cu) ||
-                                        (isMyEcho && msg.toId == chatType.friendId)
-                                    } else {
-                                        msg.fromId == chatType.friendId
-                                    }
-                                    if (isRelevant) {
-                                        if (isMyEcho) {
-                                            val localIdx = messages.indexOfFirst {
-                                                it.id.startsWith("local_") &&
-                                                it.contentType == msg.contentType &&
-                                                it.content == msg.content &&
-                                                kotlin.math.abs(it.timestamp - msg.timestamp) < 15_000
-                                            }
-                                            if (localIdx >= 0) messages.removeAt(localIdx)
-                                        }
+                                    // 先做回显匹配：如果这条是我刚发出消息的回显，先把乐观副本删掉，
+                                    // 否则会出现"刚发的 + 回显/缓存"两条（旧逻辑依赖 currentUser，冷启动时必然失效）
+                                    val outgoing = isMyOutgoing(msg)
+                                    val matchedEcho = removeMatchingLocalEcho(
+                                        serverMsg = msg,
+                                        allowLooseFallback = outgoing
+                                    )
+                                    if (msg.fromId == chatType.friendId || outgoing) {
+                                        // 回显消息由 SanjinChatApp 全局 listener 负责写入 cache，这里不重复保存
                                         if (messages.none { it.id == msg.id }) {
                                             messages.add(msg)
                                             if (messages.isNotEmpty()) runCatching { listState.animateScrollToItem(messages.size - 1) }
                                         }
+                                        if (matchedEcho) collapseEchoDuplicates()
                                     }
                                 }
                             }
@@ -252,21 +416,16 @@ fun ChatScreen(
                                 if (chatType is ChatType.Group) {
                                     val msg = event.message
                                     if (msg.groupId == chatType.groupId) {
-                                        val cu = currentUser?.id
-                                        val isMyEcho = cu != null && msg.fromId == cu
-                                        if (isMyEcho) {
-                                            val localIdx = messages.indexOfFirst {
-                                                it.id.startsWith("local_") &&
-                                                it.contentType == msg.contentType &&
-                                                it.content == msg.content &&
-                                                kotlin.math.abs(it.timestamp - msg.timestamp) < 15_000
-                                            }
-                                            if (localIdx >= 0) messages.removeAt(localIdx)
-                                        }
+                                        val outgoing = isMyOutgoing(msg)
+                                        val matchedEcho = removeMatchingLocalEcho(
+                                            serverMsg = msg,
+                                            allowLooseFallback = outgoing
+                                        )
                                         if (messages.none { it.id == msg.id }) {
                                             messages.add(msg)
                                             if (messages.isNotEmpty()) runCatching { listState.animateScrollToItem(messages.size - 1) }
                                         }
+                                        if (matchedEcho) collapseEchoDuplicates()
                                     }
                                 }
                             }
@@ -297,14 +456,13 @@ fun ChatScreen(
             if (file == null) { sendingError = "读取图片失败"; return@launch }
             val up = app.apiClient.uploadImage(token, file)
             up.onSuccess { (url) ->
+                val cu = currentUser?.id ?: savedUserId.value ?: ""
                 val ok = when (chatType) {
                     is ChatType.Private -> app.webSocketClient.sendPrivateImage(chatType.friendId, url)
                     is ChatType.Group -> app.webSocketClient.sendGroupImage(chatType.groupId, url)
                 }
                 if (ok) {
-                    val cu = currentUser?.id ?: ""
-                    val localMsg = ChatMessage(
-                        id = "local_${System.currentTimeMillis()}",
+                    addOptimisticMsg(
                         type = when (chatType) {
                             is ChatType.Private -> "private_message"
                             is ChatType.Group -> "group_message"
@@ -315,11 +473,8 @@ fun ChatScreen(
                         groupId = if (chatType is ChatType.Group) chatType.groupId else null,
                         contentType = "image",
                         content = "[图片]",
-                        image = url,
-                        timestamp = System.currentTimeMillis()
+                        image = url
                     )
-                    messages.add(localMsg)
-                    runCatching { listState.animateScrollToItem(messages.size - 1) }
                 } else sendingError = "发送图片失败"
             }.onFailure { e -> sendingError = "上传图片：${e.message}" }
         }
@@ -379,10 +534,15 @@ fun ChatScreen(
         label = "recordBtnScale"
     )
 
+    val statusPad = WindowInsets.statusBars.asPaddingValues()
+    val navPad = WindowInsets.navigationBars.asPaddingValues()
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .padding(top = statusPad.calculateTopPadding())
+            .padding(bottom = navPad.calculateBottomPadding())
             .animateContentSize(animationSpec = tween(200))
     ) {
         Row(
@@ -466,8 +626,8 @@ fun ChatScreen(
                             showSender = (chatType is ChatType.Group) && !isSelf,
                             mediaUrlResolver = { app.apiClient.mediaUrl(it) },
                             audioPlayer = audioPlayer,
-                            modifier = Modifier.animateItemPlacement(
-                                animationSpec = spring(
+                            modifier = Modifier.animateItem(
+                                placementSpec = spring(
                                     dampingRatio = 0.85f,
                                     stiffness = Spring.StiffnessMediumLow
                                 )
@@ -625,9 +785,8 @@ fun ChatScreen(
                                                         )
                                                     }
                                                     if (ok) {
-                                                        val cu = currentUser?.id ?: ""
-                                                        val localMsg = ChatMessage(
-                                                            id = "local_${System.currentTimeMillis()}",
+                                                        val cu = currentUser?.id ?: savedUserId.value ?: ""
+                                                        addOptimisticMsg(
                                                             type = when (chatType) {
                                                                 is ChatType.Private -> "private_message"
                                                                 is ChatType.Group -> "group_message"
@@ -638,11 +797,8 @@ fun ChatScreen(
                                                             groupId = if (chatType is ChatType.Group) chatType.groupId else null,
                                                             contentType = "audio",
                                                             content = "[语音 ${uf.durationSec}s]",
-                                                            audio = audioJson,
-                                                            timestamp = System.currentTimeMillis()
+                                                            audio = audioJson
                                                         )
-                                                        messages.add(localMsg)
-                                                        runCatching { listState.animateScrollToItem(messages.size - 1) }
                                                     } else {
                                                         sendingError = "发送语音失败"
                                                     }
@@ -676,7 +832,14 @@ fun ChatScreen(
                 value = messageInput,
                 onValueChange = { messageInput = it },
                 label = { Text("消息", fontSize = 10.sp) },
-                modifier = Modifier.weight(1f),
+                modifier = Modifier
+                    .weight(1f)
+                    .animateContentSize(
+                        animationSpec = spring(
+                            dampingRatio = 0.82f,
+                            stiffness = Spring.StiffnessMediumLow
+                        )
+                    ),
                 singleLine = true
             )
             Spacer(modifier = Modifier.width(4.dp))
@@ -710,8 +873,8 @@ fun ChatScreen(
                             }
                             if (sent) {
                                 messageInput = ""
-                                val localMsg = ChatMessage(
-                                    id = "local_${System.currentTimeMillis()}",
+                                // 乐观消息不再写入持久化 cache（只有服务器真实回显消息会在全局 listener 写入）
+                                addOptimisticMsg(
                                     type = when (chatType) {
                                         is ChatType.Private -> "private_message"
                                         is ChatType.Group -> "group_message"
@@ -721,16 +884,8 @@ fun ChatScreen(
                                     toId = if (chatType is ChatType.Private) chatType.friendId else null,
                                     groupId = if (chatType is ChatType.Group) chatType.groupId else null,
                                     contentType = "text",
-                                    content = text,
-                                    timestamp = System.currentTimeMillis()
+                                    content = text
                                 )
-                                messages.add(localMsg)
-                                runCatching { listState.animateScrollToItem(messages.size - 1) }
-                                val convId = when (chatType) {
-                                    is ChatType.Private -> MessageCache.privateConvId(chatType.friendId)
-                                    is ChatType.Group -> MessageCache.groupConvId(chatType.groupId)
-                                }
-                                app.messageCache.saveMessage(convId, localMsg)
                             } else sendingError = "WebSocket 未连接，请等待重连"
                         }
                     }

@@ -712,7 +712,11 @@ class ApiClient(private val context: Context) {
         val totalUsers: Int,
         val totalGroups: Int,
         val uptimeSeconds: Long,
-        val isAdmin: Boolean
+        val isAdmin: Boolean,
+        // 新增：服务器版本 / 协议 / 地址
+        val serverVersion: String,
+        val serverProtocol: String,
+        val serverAddress: String
     )
 
     /** GET /api/server/info 服务器公开信息（含统计） */
@@ -736,7 +740,10 @@ class ApiClient(private val context: Context) {
                         totalUsers = obj.optInt("totalUsers", 0),
                         totalGroups = obj.optInt("totalGroups", 0),
                         uptimeSeconds = obj.optLong("uptimeSeconds", 0L),
-                        isAdmin = obj.optBoolean("isAdmin", false)
+                        isAdmin = obj.optBoolean("isAdmin", false),
+                        serverVersion = obj.optString("serverVersion", ""),
+                        serverProtocol = obj.optString("serverProtocol", "ws"),
+                        serverAddress = obj.optString("serverAddress", "")
                     ))
                 } else {
                     Result.failure(Exception(obj.optString("error", "获取服务器信息失败")))
@@ -1153,4 +1160,159 @@ class ApiClient(private val context: Context) {
         },
         defaultErr = "下架失败"
     ) { _, _ -> true }
+
+    // ==================================================================
+    //  应用内更新
+    //  GET /api/update/check?channel=stable
+    //  自定义通道：直接拉取用户填写的 version.json URL
+    // ==================================================================
+
+    data class AppUpdate(
+        val hasUpdate: Boolean,
+        val versionCode: Int,
+        val versionName: String,
+        val apkUrl: String,        // 完整可下载 URL
+        val changelog: String,
+        val channel: String,
+        val forceUpdate: Boolean,
+        val minSdk: Int
+    )
+
+    /**
+     * 检查更新。
+     * @param channel stable / beta / 自定义 http(s) URL（指向 version.json）
+     * @param currentVersionCode 当前应用的 versionCode
+     */
+    suspend fun checkUpdate(channel: String, currentVersionCode: Int): Result<AppUpdate> = withContext(Dispatchers.IO) {
+        try {
+            val ch = channel.trim()
+            // 自定义通道：直接拉取用户填写的 version.json
+            if (ch.startsWith("http://") || ch.startsWith("https://")) {
+                val request = Request.Builder().url(ch).get().build()
+                client().newCall(request).execute().use { response ->
+                    val body = response.body?.string() ?: ""
+                    if (!response.isSuccessful) return@use Result.failure(Exception("HTTP ${response.code}"))
+                    val obj = JSONObject(body)
+                    val info = parseUpdateJson(obj, currentVersionCode, baseUrl())
+                    return@use Result.success(info)
+                }
+            }
+
+            // 标准通道：走服务端 /api/update/check
+            val request = Request.Builder()
+                .url("${baseUrl()}/api/update/check?channel=${encode(ch)}")
+                .get()
+                .build()
+            client().newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: ""
+                val obj = parseJsonOrFallback(response, body, "检查更新失败")
+                if (!response.isSuccessful || !obj.optBoolean("ok")) {
+                    return@use Result.failure(Exception(obj.optString("error", "检查更新失败")))
+                }
+                // 服务端没有版本文件
+                if (!obj.optBoolean("hasUpdate")) {
+                    return@use Result.success(AppUpdate(
+                        hasUpdate = false, versionCode = 0, versionName = "",
+                        apkUrl = "", changelog = "", channel = ch, forceUpdate = false, minSdk = 0
+                    ))
+                }
+                // 服务端返回自定义 URL（自定义通道在服务端被透传）
+                val customUrl = obj.optString("customUrl")
+                if (customUrl.isNotBlank() && (customUrl.startsWith("http://") || customUrl.startsWith("https://"))) {
+                    val req2 = Request.Builder().url(customUrl).get().build()
+                    client().newCall(req2).execute().use { resp2 ->
+                        val body2 = resp2.body?.string() ?: ""
+                        if (!resp2.isSuccessful) return@use Result.failure(Exception("自定义通道 HTTP ${resp2.code}"))
+                        val obj2 = JSONObject(body2)
+                        return@use Result.success(parseUpdateJson(obj2, currentVersionCode, baseUrl()))
+                    }
+                }
+                // 服务端直接返回版本信息
+                val info = parseUpdateJson(obj, currentVersionCode, baseUrl())
+                Result.success(info)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private fun parseUpdateJson(obj: JSONObject, currentVersionCode: Int, baseUrl: String): AppUpdate {
+        val serverCode = obj.optInt("versionCode", 0)
+        val apkUrl = obj.optString("apkUrl", "").let { u ->
+            if (u.startsWith("http://") || u.startsWith("https://")) u
+            else if (u.startsWith("/")) "$baseUrl$u"
+            else "$baseUrl/$u"
+        }
+        return AppUpdate(
+            hasUpdate = serverCode > currentVersionCode,
+            versionCode = serverCode,
+            versionName = obj.optString("versionName", serverCode.toString()),
+            apkUrl = apkUrl,
+            changelog = obj.optString("changelog", ""),
+            channel = obj.optString("channel", ""),
+            forceUpdate = obj.optBoolean("forceUpdate", false),
+            minSdk = obj.optInt("minSdk", 0)
+        )
+    }
+
+    /**
+     * 下载 APK 到外部缓存目录并返回文件。
+     * @param onProgress 下载进度回调（0-100）
+     */
+    suspend fun downloadApk(apkUrl: String, onProgress: (Int) -> Unit = {}): Result<File> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder().url(apkUrl).get().build()
+            client().newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return@use Result.failure(Exception("下载失败 HTTP ${response.code}"))
+                val body = response.body ?: return@use Result.failure(Exception("响应体为空"))
+                val contentLength = body.contentLength()
+                val dir = context.externalCacheDir ?: context.cacheDir
+                val apkFile = File(dir, "sanjinchat-update.apk")
+                if (apkFile.exists()) apkFile.delete()
+
+                var downloaded = 0L
+                body.byteStream().use { input ->
+                    apkFile.outputStream().use { output ->
+                        val buffer = ByteArray(8 * 1024)
+                        var read: Int
+                        while (input.read(buffer).also { read = it } != -1) {
+                            output.write(buffer, 0, read)
+                            downloaded += read
+                            if (contentLength > 0) {
+                                val pct = (downloaded * 100 / contentLength).toInt()
+                                onProgress(pct)
+                            }
+                        }
+                        output.flush()
+                    }
+                }
+                onProgress(100)
+                Result.success(apkFile)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 拉起系统安装器安装指定 APK 文件。
+     * 通过 FileProvider 生成 content:// URI，适配 Android 7.0+。
+     */
+    fun installApk(apkFile: File) {
+        try {
+            val apkUri = androidx.core.content.FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                apkFile
+            )
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(apkUri, "application/vnd.android.package-archive")
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            android.util.Log.e("ApiClient", "安装 APK 失败: ${e.message}")
+        }
+    }
 }

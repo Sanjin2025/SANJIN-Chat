@@ -24,10 +24,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -109,10 +113,14 @@ fun DpiSetupScreen(navController: NavController) {
     val hPadding = if (isRound) 18.dp else 10.dp
     val scrollState = rememberScrollState()
 
+    val statusPad = WindowInsets.statusBars.asPaddingValues()
+    val navPad = WindowInsets.navigationBars.asPaddingValues()
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .padding(top = statusPad.calculateTopPadding())
+            .padding(bottom = navPad.calculateBottomPadding())
             .verticalScroll(scrollState)
             .padding(horizontal = hPadding, vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -145,21 +153,21 @@ fun DpiSetupScreen(navController: NavController) {
             label = "finishBtnScale"
         )
 
-        // 步骤切换：Expressive 形变（横向滑入 + 缩放 + 淡入淡出）
+        // 步骤切换：更激进的 Expressive 形变（1/2 屏宽横向滑入 + 更夸张缩放 + 更长 Emphasized 缓动）
         AnimatedContent(
             targetState = step,
             transitionSpec = {
-                (slideInHorizontally(animationSpec = tween(350, easing = ExpressiveMotion.EmphasizedEasing)) { it / 3 } +
-                    fadeIn(tween(300, easing = ExpressiveMotion.EmphasizedDecelerate)) +
+                (slideInHorizontally(animationSpec = tween(450, easing = ExpressiveMotion.EmphasizedEasing)) { it / 2 } +
+                    fadeIn(tween(380, easing = ExpressiveMotion.EmphasizedDecelerate)) +
                     scaleIn(
-                        initialScale = 0.92f,
-                        animationSpec = spring(dampingRatio = 0.8f, stiffness = Spring.StiffnessMediumLow)
+                        initialScale = 0.88f,
+                        animationSpec = spring(dampingRatio = 0.75f, stiffness = Spring.StiffnessMediumLow)
                     )) togetherWith
-                (slideOutHorizontally(animationSpec = tween(220, easing = ExpressiveMotion.EmphasizedAccelerate)) { -it / 3 } +
-                    fadeOut(tween(180)) +
+                (slideOutHorizontally(animationSpec = tween(260, easing = ExpressiveMotion.EmphasizedAccelerate)) { -it / 2 } +
+                    fadeOut(tween(200)) +
                     scaleOut(
-                        targetScale = 0.96f,
-                        animationSpec = spring(dampingRatio = 0.85f, stiffness = Spring.StiffnessMedium)
+                        targetScale = 0.92f,
+                        animationSpec = spring(dampingRatio = 0.85f, stiffness = Spring.StiffnessMediumLow)
                     ))
             },
             label = "setupStep",
@@ -192,7 +200,14 @@ fun DpiSetupScreen(navController: NavController) {
                         Text(msg, fontSize = 8.sp, color = MaterialTheme.colorScheme.error)
                     }
                 },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .animateContentSize(
+                        animationSpec = spring(
+                            dampingRatio = 0.82f,
+                            stiffness = Spring.StiffnessMediumLow
+                        )
+                    ),
                 textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp)
             )
             Spacer(Modifier.height(6.dp))

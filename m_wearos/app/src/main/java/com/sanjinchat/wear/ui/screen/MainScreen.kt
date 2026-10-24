@@ -34,11 +34,15 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -57,6 +61,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -142,6 +147,8 @@ private enum class DialogKind {
     DpiSettings,
     ExposureBoard,
     KeepAlive,
+    ServerInfo,
+    UpdateCheck,
 }
 
 @Composable
@@ -293,10 +300,15 @@ fun MainScreen(navController: NavController) {
         ConnectionState.Disconnected -> "已断开"
     }
 
+    val statusBarsPad = WindowInsets.statusBars.asPaddingValues()
+    val navBarsPad = WindowInsets.navigationBars.asPaddingValues()
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .padding(top = statusBarsPad.calculateTopPadding())
+            .padding(bottom = navBarsPad.calculateBottomPadding())
     ) {
         if (dialogKind != DialogKind.None) {
             Box(
@@ -585,6 +597,12 @@ fun MainScreen(navController: NavController) {
                     DialogKind.KeepAlive -> KeepAlivePanel(
                         onClose = { dialogKind = DialogKind.None }
                     )
+                    DialogKind.ServerInfo -> ServerInfoPanel(
+                        onClose = { dialogKind = DialogKind.None }
+                    )
+                    DialogKind.UpdateCheck -> UpdateCheckPanel(
+                        onClose = { dialogKind = DialogKind.None }
+                    )
                     DialogKind.None -> {}
                 }
             }
@@ -685,32 +703,32 @@ fun MainScreen(navController: NavController) {
                 }
             }
 
-            // ===== Expressive 动效：Tab 切换 =====
+            // ===== Expressive 动效：Tab 切换（更强视觉，手机大屏必可见） =====
             AnimatedContent(
                 targetState = currentTab,
                 transitionSpec = {
                     (slideInHorizontally(
-                        animationSpec = tween(350, easing = ExpressiveMotion.EmphasizedEasing),
-                        initialOffsetX = { it / 3 }
+                        animationSpec = tween(450, easing = ExpressiveMotion.EmphasizedEasing),
+                        initialOffsetX = { it / 2 }  // Expressive：位移从 1/2 屏宽开始（更夸张）
                     ) +
-                        fadeIn(tween(300, easing = ExpressiveMotion.EmphasizedDecelerate)) +
+                        fadeIn(tween(380, easing = ExpressiveMotion.EmphasizedDecelerate)) +
                         scaleIn(
-                            initialScale = 0.95f,
+                            initialScale = 0.90f,
                             animationSpec = spring(
-                                dampingRatio = 0.8f,
+                                dampingRatio = 0.75f,
                                 stiffness = Spring.StiffnessMediumLow
                             )
                         )) togetherWith
                     (slideOutHorizontally(
-                        animationSpec = tween(220, easing = ExpressiveMotion.EmphasizedAccelerate),
-                        targetOffsetX = { -it / 3 }
+                        animationSpec = tween(260, easing = ExpressiveMotion.EmphasizedAccelerate),
+                        targetOffsetX = { -it / 2 }
                     ) +
-                        fadeOut(tween(180)) +
+                        fadeOut(tween(200)) +
                         scaleOut(
-                            targetScale = 0.97f,
+                            targetScale = 0.93f,
                             animationSpec = spring(
                                 dampingRatio = 0.85f,
-                                stiffness = Spring.StiffnessMedium
+                                stiffness = Spring.StiffnessMediumLow
                             )
                         ))
                 },
@@ -1151,6 +1169,26 @@ fun MainScreen(navController: NavController) {
                                     label = { Text("退出登录", color = ErrorLight) },
                                     colors = AssistChipDefaults.assistChipColors(
                                         containerColor = ErrorDeep
+                                    ),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                            item {
+                                AssistChip(
+                                    onClick = { dialogKind = DialogKind.ServerInfo },
+                                    label = { Text("服务器信息", color = MaterialTheme.colorScheme.secondary) },
+                                    colors = AssistChipDefaults.assistChipColors(
+                                        containerColor = MaterialTheme.colorScheme.surface
+                                    ),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                            item {
+                                AssistChip(
+                                    onClick = { dialogKind = DialogKind.UpdateCheck },
+                                    label = { Text("检查更新", color = MaterialTheme.colorScheme.secondary) },
+                                    colors = AssistChipDefaults.assistChipColors(
+                                        containerColor = MaterialTheme.colorScheme.surface
                                     ),
                                     modifier = Modifier.fillMaxWidth()
                                 )
@@ -2088,8 +2126,16 @@ private fun SmallButton(
     primary: Boolean = false,
     destructive: Boolean = false
 ) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.92f else 1f,
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessHigh),
+        label = "smallBtn_$label"
+    )
     Button(
         onClick = onClick,
+        interactionSource = interaction,
         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
         colors = when {
             destructive -> ButtonDefaults.buttonColors(
@@ -2103,6 +2149,10 @@ private fun SmallButton(
                 containerColor = MaterialTheme.colorScheme.surface,
                 contentColor = MaterialTheme.colorScheme.onSurface
             )
+        },
+        modifier = Modifier.graphicsLayer {
+            scaleX = scale
+            scaleY = scale
         }
     ) {
         Text(label, fontSize = 10.sp)
@@ -2117,19 +2167,40 @@ private fun ActionChip(
     modifier: Modifier = Modifier,
     highlighted: Boolean = false
 ) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.94f else 1f,
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessHigh),
+        label = "actionChip_$label"
+    )
     FilterChip(
         selected = false,
         onClick = onClick,
+        interactionSource = interaction,
         label = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(sym, fontSize = 11.sp)
                 Spacer(Modifier.width(4.dp))
-                Text(label, fontSize = 10.sp)
+                Text(
+                    label,
+                    fontSize = 10.sp,
+                    modifier = Modifier.animateContentSize(
+                        animationSpec = spring(
+                            dampingRatio = 0.8f,
+                            stiffness = Spring.StiffnessMediumLow
+                        )
+                    )
+                )
             }
         },
         modifier = modifier
             .clip(RoundedCornerShape(12.dp))
-            .height(32.dp),
+            .height(32.dp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            },
         colors = FilterChipDefaults.filterChipColors(
             containerColor = if (highlighted) PurpleDeep else MaterialTheme.colorScheme.surface,
             labelColor = if (highlighted) PurpleLight else MaterialTheme.colorScheme.onSurface
@@ -2137,6 +2208,7 @@ private fun ActionChip(
     )
 }
 
+@OptIn(androidx.compose.material3.ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun TabButton(
     label: String,
@@ -2146,18 +2218,37 @@ private fun TabButton(
     modifier: Modifier = Modifier,
     badgeCount: Int = 0
 ) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    // 按压缩放规格取自主题 MotionScheme（Expressive），与 M3 组件保持一致
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.94f else if (selected) 1.0f else 0.98f,
+        animationSpec = MaterialTheme.motionScheme.fastSpatialSpec<Float>(),
+        label = "tabBtn_$label"
+    )
     Box(modifier = modifier) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(10.dp))
-                .clickable { onClick() }
+                .clickable(
+                    interactionSource = interaction,
+                    indication = androidx.compose.material3.ripple()
+                ) { onClick() }
+                .graphicsLayer {
+                    scaleX = scale
+                    scaleY = scale
+                }
                 .background(
                     if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
                     else Color.Transparent
                 )
                 .padding(vertical = 3.dp)
+                .animateContentSize(
+                    animationSpec =
+                        MaterialTheme.motionScheme.defaultSpatialSpec<androidx.compose.ui.unit.IntSize>()
+                )
         ) {
             Text(sym, fontSize = 13.sp)
             Text(
@@ -2291,9 +2382,22 @@ private fun FriendListItem(
     onClick: () -> Unit,
     onDelete: () -> Unit
 ) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.96f else 1f,
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessHigh),
+        label = "friendItem_${friend.userId}"
+    )
     Card(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth()
+        interactionSource = interaction,
+        modifier = Modifier
+            .fillMaxWidth()
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -2464,6 +2568,12 @@ private fun EmptyState(text: String) {
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 18.dp)
+            .animateContentSize(
+                animationSpec = spring(
+                    dampingRatio = 0.8f,
+                    stiffness = Spring.StiffnessMediumLow
+                )
+            )
     ) {
         Text(
             text = text,
@@ -2475,10 +2585,23 @@ private fun EmptyState(text: String) {
 }
 
 @Composable
-private fun SettingsCard(title: String, content: String) {
+private fun SettingsCard(title: String, content: String, onClick: () -> Unit = {}) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.96f else 1f,
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessHigh),
+        label = "settingsCard_$title"
+    )
     Card(
-        onClick = { /* reserved */ },
-        modifier = Modifier.fillMaxWidth(),
+        onClick = onClick,
+        interactionSource = interaction,
+        modifier = Modifier
+            .fillMaxWidth()
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            },
         shape = RoundedCornerShape(8.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
@@ -2615,7 +2738,272 @@ private fun AboutPanel(onClose: () -> Unit) {
     }
 }
 
-// ==================== 个人资料面板 ====================
+// ==================== 服务器信息面板 ====================
+
+@Composable
+private fun ServerInfoPanel(onClose: () -> Unit) {
+    val app = SanjinChatApp.instance
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
+    var loading by remember { mutableStateOf(true) }
+    var info by remember { mutableStateOf<ApiClient.ServerInfo?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        loading = true
+        error = null
+        app.apiClient.getServerInfo().fold(
+            onSuccess = { info = it },
+            onFailure = { e -> error = e.message ?: "获取服务器信息失败" }
+        )
+        loading = false
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 8.dp)
+    ) {
+        PageHeader(title = "服务器信息", onBack = onClose)
+        Spacer(Modifier.height(8.dp))
+
+        when {
+            loading -> {
+                Text("正在获取服务器信息…", color = OnSurfaceVariant, fontSize = 11.sp)
+            }
+            error != null -> {
+                Text("获取失败：$error", color = ErrorLight, fontSize = 11.sp)
+            }
+            info != null -> {
+                val s = info!!
+                InfoRow("服务器名称", s.serverName)
+                InfoRow("服务器版本", s.serverVersion.ifBlank { "未知" })
+                InfoRow("服务器协议", s.serverProtocol.uppercase())
+                InfoRow("服务器地址", s.serverAddress.ifBlank { app.webSocketClient.serverAddress })
+                if (s.serverDescription.isNotBlank()) {
+                    InfoRow("服务器描述", s.serverDescription)
+                }
+                if (s.serverAnnouncement.isNotBlank()) {
+                    InfoRow("服务器公告", s.serverAnnouncement)
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        DialogFooter(
+            onCancel = onClose,
+            confirmLabel = "关闭",
+            onConfirm = onClose
+        )
+    }
+}
+
+@Composable
+private fun InfoRow(label: String, value: String) {
+    Column(modifier = Modifier.padding(vertical = 4.dp)) {
+        Text(label, fontSize = 10.sp, color = OnSurfaceVariant)
+        Spacer(Modifier.height(1.dp))
+        Text(
+            text = value,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+    }
+}
+
+// ==================== 检查更新面板 ====================
+
+@Composable
+private fun UpdateCheckPanel(onClose: () -> Unit) {
+    val app = SanjinChatApp.instance
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
+    val currentVersionCode = remember {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).let {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) it.longVersionCode.toInt()
+                else @Suppress("DEPRECATION") it.versionCode
+            }
+        }.getOrDefault(0)
+    }
+    val currentVersionName = remember {
+        runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull() ?: currentVersionCode.toString()
+    }
+
+    var channel by remember { mutableStateOf("stable") }
+    var customUrl by remember { mutableStateOf("") }
+    var checking by remember { mutableStateOf(false) }
+    var checkResult by remember { mutableStateOf<ApiClient.AppUpdate?>(null) }
+    var checkMsg by remember { mutableStateOf<String?>(null) }
+    var downloading by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableStateOf(0) }
+    var downloadError by remember { mutableStateOf<String?>(null) }
+
+    // 读取保存的通道
+    LaunchedEffect(Unit) {
+        val saved = app.preferenceManager.updateChannel.first()
+        if (saved.startsWith("http://") || saved.startsWith("https://")) {
+            channel = "custom"
+            customUrl = saved
+        } else {
+            channel = saved
+        }
+    }
+
+    fun doCheck() {
+        scope.launch {
+            checking = true
+            checkResult = null
+            checkMsg = null
+            downloadError = null
+            val ch = if (channel == "custom") customUrl.trim() else channel
+            if (channel == "custom" && ch.isBlank()) {
+                checkMsg = "请填写自定义通道 URL"
+                checking = false
+                return@launch
+            }
+            // 保存通道
+            app.preferenceManager.saveUpdateChannel(ch)
+            app.apiClient.checkUpdate(ch, currentVersionCode).fold(
+                onSuccess = { update ->
+                    checkResult = update
+                    if (!update.hasUpdate) {
+                        checkMsg = "已是最新版本"
+                    }
+                },
+                onFailure = { e -> checkMsg = "检查失败：${e.message ?: "未知错误"}" }
+            )
+            checking = false
+        }
+    }
+
+    fun doDownload() {
+        val update = checkResult ?: return
+        scope.launch {
+            downloading = true
+            downloadProgress = 0
+            downloadError = null
+            app.apiClient.downloadApk(update.apkUrl) { pct -> downloadProgress = pct }.fold(
+                onSuccess = { apkFile -> app.apiClient.installApk(apkFile) },
+                onFailure = { e -> downloadError = "下载失败：${e.message ?: "未知错误"}" }
+            )
+            downloading = false
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 8.dp)
+    ) {
+        PageHeader(title = "检查更新", onBack = onClose)
+        Spacer(Modifier.height(8.dp))
+
+        Text("当前版本", fontSize = 10.sp, color = OnSurfaceVariant)
+        Text(currentVersionName, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+        Spacer(Modifier.height(8.dp))
+
+        Text("更新通道", fontSize = 10.sp, color = OnSurfaceVariant)
+        Spacer(Modifier.height(2.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            listOf("stable", "beta", "custom").forEach { ch ->
+                FilterChip(
+                    selected = channel == ch,
+                    onClick = { channel = ch },
+                    label = {
+                        Text(
+                            when (ch) {
+                                "stable" -> "正式版"
+                                "beta" -> "测试版"
+                                else -> "自定义"
+                            },
+                            fontSize = 10.sp
+                        )
+                    }
+                )
+            }
+        }
+        if (channel == "custom") {
+            Spacer(Modifier.height(4.dp))
+            OutlinedTextField(
+                value = customUrl,
+                onValueChange = { customUrl = it },
+                label = { Text("自定义 version.json URL", fontSize = 9.sp) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 10.sp)
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Button(
+            onClick = { doCheck() },
+            enabled = !checking,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(if (checking) "检查中…" else "检查更新")
+        }
+
+        checkMsg?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(it, fontSize = 10.sp, color = if (it.contains("失败")) ErrorLight else MaterialTheme.colorScheme.secondary)
+        }
+
+        checkResult?.takeIf { it.hasUpdate }?.let { update ->
+            Spacer(Modifier.height(8.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(modifier = Modifier.padding(8.dp)) {
+                    Text("发现新版本", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                    Text("版本 ${update.versionName}", fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurface)
+                    if (update.changelog.isNotBlank()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text("更新内容：", fontSize = 10.sp, color = OnSurfaceVariant)
+                        Text(update.changelog, fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurface)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    if (downloading) {
+                        Text("下载中 $downloadProgress%", fontSize = 10.sp, color = MaterialTheme.colorScheme.secondary)
+                        LinearProgressIndicator(
+                            progress = { downloadProgress / 100f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    } else {
+                        Button(
+                            onClick = { doDownload() },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("下载并安装")
+                        }
+                    }
+                    downloadError?.let {
+                        Spacer(Modifier.height(4.dp))
+                        Text(it, fontSize = 9.sp, color = ErrorLight)
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        DialogFooter(
+            onCancel = onClose,
+            confirmLabel = "关闭",
+            onConfirm = onClose
+        )
+    }
+}
 
 @Composable
 private fun ProfilePanel(onClose: () -> Unit) {

@@ -37,6 +37,7 @@ const otpMod = require('./src/otp');
 const exposureBoardMod = require('./src/exposureBoard');
 const announcementMod = require('./src/announcement');
 const serverInfoMod = require('./src/serverInfo');
+const updateMod = require('./src/update');
 const cleanupMod = require('./src/cleanup');
 const ChatServer = require('./src/chatServer');
 
@@ -177,7 +178,8 @@ const MIME_MAP = {
   '.ogg': 'audio/ogg',
   '.wav': 'audio/wav',
   '.webm': 'audio/webm',
-  '.m4a': 'audio/mp4'
+  '.m4a': 'audio/mp4',
+  '.apk': 'application/vnd.android.package-archive'
 };
 
 function serveStaticFile(filePath, res, extraHeaders = {}) {
@@ -229,6 +231,19 @@ function handleUploadsRequest(pathname, res) {
   return true;
 }
 
+/** 服务 /update/ 下的文件（APK 下载等） */
+function handleUpdateRequest(pathname, res) {
+  if (!pathname.startsWith('/update/')) return false;
+  const relative = pathname.slice('/update/'.length);
+  if (relative.includes('..') || path.isAbsolute(relative)) {
+    sendText(res, 403, '禁止访问');
+    return true;
+  }
+  const filePath = path.join(updateMod.UPDATE_DIR, relative);
+  serveStaticFile(filePath, res);
+  return true;
+}
+
 // ==================== HTTP 路由处理 ====================
 
 async function handleHttpRequest(req, res) {
@@ -246,9 +261,10 @@ async function handleHttpRequest(req, res) {
 
   const urlPath = getUrlPath(req.url);
 
-  // ------ 静态页面 / 上传文件 ------
+  // ------ 静态页面 / 上传文件 / 更新文件 ------
   if (req.method === 'GET' && handleStaticRequest(urlPath, res)) return;
   if (req.method === 'GET' && handleUploadsRequest(urlPath, res)) return;
+  if (req.method === 'GET' && handleUpdateRequest(urlPath, res)) return;
 
   // ------ 动态路由匹配 ------
   try {
@@ -698,7 +714,7 @@ async function handleHttpRequest(req, res) {
 
     // ====== 服务器信息 ======
     if (urlPath === '/api/server/info' && req.method === 'GET') {
-      const info = serverInfoMod.getServerInfo();
+      const info = serverInfoMod.getServerInfo(req);
       return sendJson(res, 200, { ok: true, ...info });
     }
     if (urlPath === '/api/server/info' && req.method === 'PUT') {
@@ -723,6 +739,23 @@ async function handleHttpRequest(req, res) {
       const body = await readJsonBody(req);
       const result = await serverInfoMod.setLogoEmoji(user, body.emoji);
       return sendJson(res, 200, result);
+    }
+
+    // ====== 客户端更新检查 ======
+    // GET /api/update/check?channel=stable  （公开，无需登录）
+    // channel: stable / beta / 自定义 http(s) URL
+    if (urlPath === '/api/update/check' && req.method === 'GET') {
+      const urlObj = new URL(req.url, 'http://x');
+      const channel = urlObj.searchParams.get('channel') || 'stable';
+      const info = updateMod.getUpdateInfo(channel);
+      if (info === null) {
+        return sendJson(res, 200, { ok: true, hasUpdate: false, reason: '通道无版本文件' });
+      }
+      // 自定义 URL：服务端不代理，直接返回给客户端去拉取
+      if (info.customUrl) {
+        return sendJson(res, 200, { ok: true, hasUpdate: true, customUrl: info.customUrl, channel: 'custom' });
+      }
+      return sendJson(res, 200, { ok: true, hasUpdate: true, ...info });
     }
 
     // ====== 兜底：404 ======

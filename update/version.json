@@ -1,0 +1,10 @@
+{
+  "versionCode": 20261025,
+  "versionName": "20261025",
+  "apkUrl": "sanjinchat-wear.apk",
+  "changelog": "1. 新增服务器信息页\n2. 新增客户端自动检查更新\n3. 支持 stable/beta/自定义通道切换\n4. 版本号改为编译日期格式",
+  "channel": "stable",
+  "minSdk": 26,
+  "forceUpdate": false,
+  "releasedAt": "2026-10-25"
+}

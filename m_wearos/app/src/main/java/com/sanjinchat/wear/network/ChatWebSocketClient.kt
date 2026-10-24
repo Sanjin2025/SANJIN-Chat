@@ -14,6 +14,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -67,8 +68,19 @@ class ChatWebSocketClient {
     }
 
     private var webSocket: WebSocket? = null
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // 注意：scope 不能因 Activity onDestroy 而 cancel。
+    // 从任务管理器划掉后进程常存活，重开时 webSocketClient 会被复用；
+    // 若 scope 被取消，connect() 里的 watchdog/timeout 以及 handleMessage 的 scope.launch 都不会执行，
+    // 导致 connectionState 永远卡在 Connecting、登录超时。
+    private var scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var reconnectJob: Job? = null
+
+    /** 若协程作用域已被取消（例如被错误地 destroy 过），重建一个新的，保证 connect 能正常工作。 */
+    private fun ensureScope() {
+        if (!scope.isActive) {
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        }
+    }
 
     var serverAddress: String = ""
         set(value) {
@@ -120,17 +132,33 @@ class ChatWebSocketClient {
 
     private var manualDisconnect = false
     private var connectingTimeoutJob: Job? = null
+    private var connectionWatchdogJob: Job? = null
 
     fun connect(token: String) {
+        ensureScope()
         currentToken = token
         manualDisconnect = false
         reconnectJob?.cancel()
         connectingTimeoutJob?.cancel()
+        connectionWatchdogJob?.cancel()
         // 强制关闭半死不活的旧 socket（防止 doConnect 因为 webSocket!=null 而放弃重连）
         val oldWs = webSocket
         if (oldWs != null) {
             webSocket = null
             runCatching { oldWs.close(1001, "reconnect") }
+        }
+        // 二次看门狗：12s 内仍没进入 Connected → 认为状态卡死，强制断开+重连
+        connectionWatchdogJob = scope.launch {
+            delay(12_000)
+            if (_connectionState.value is ConnectionState.Connecting) {
+                val wsNow = webSocket
+                webSocket = null
+                runCatching { wsNow?.close(1001, "watchdog force reconnect") }
+                val err = "连接状态卡死，强制重连…"
+                _connectionState.value = ConnectionState.Error(err)
+                runCatching { _events.emit(ChatEvent.Error(err)) }
+                if (!manualDisconnect) scheduleReconnect()
+            }
         }
         doConnect(token)
     }
@@ -172,14 +200,14 @@ class ChatWebSocketClient {
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                cleanupSocket()
+                cleanupSocket(ws)
                 if (!manualDisconnect) {
                     scheduleReconnect()
                 }
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                cleanupSocket()
+                cleanupSocket(ws)
                 connectingTimeoutJob?.cancel()
                 scope.launch {
                     _connectionState.value = ConnectionState.Error(t.message ?: "连接失败")
@@ -202,9 +230,15 @@ class ChatWebSocketClient {
         return "$baseClean/ws?token=$token"
     }
 
-    private fun cleanupSocket() {
-        webSocket = null
-        _connectionState.value = ConnectionState.Disconnected
+    /**
+     * 清理 socket。只有当回调对应的 ws 就是当前 webSocket 时才清空，
+     * 避免旧 socket 的 onClosed/onFailure 回调把新 connect 刚建立的 socket 误清掉。
+     */
+    private fun cleanupSocket(ws: WebSocket? = null) {
+        if (ws == null || ws === webSocket) {
+            webSocket = null
+            _connectionState.value = ConnectionState.Disconnected
+        }
     }
 
     private fun scheduleReconnect() {
@@ -222,8 +256,11 @@ class ChatWebSocketClient {
     fun disconnect() {
         manualDisconnect = true
         reconnectJob?.cancel()
+        connectingTimeoutJob?.cancel()
+        connectionWatchdogJob?.cancel()
         webSocket?.close(1000, "User disconnect")
         webSocket = null
+        currentToken = null
         _connectionState.value = ConnectionState.Disconnected
         _currentUser.value = null
         _friends.value = emptyList()
@@ -239,6 +276,7 @@ class ChatWebSocketClient {
                 when (type) {
                     "connected" -> {
                         connectingTimeoutJob?.cancel()
+                        connectionWatchdogJob?.cancel()
                         val user = parseUser(json.getJSONObject("user"))
                         _currentUser.value = user
                         _connectionState.value = ConnectionState.Connected(user)

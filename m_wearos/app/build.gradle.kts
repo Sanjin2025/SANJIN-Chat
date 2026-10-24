@@ -1,3 +1,6 @@
+import java.text.SimpleDateFormat
+import java.util.Date
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -6,14 +9,18 @@ plugins {
 
 android {
     namespace = "com.sanjinchat.wear"
-    compileSdk = 34
+    compileSdk = 35
+
+    // 版本号 = 编译日期（yyyyMMdd），例如 20261024
+    // versionCode 取整型用于比较，versionName 同值用于显示
+    val buildDate = SimpleDateFormat("yyyyMMdd").format(Date())
 
     defaultConfig {
         applicationId = "com.sanjinchat.wear"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = buildDate.toInt()
+        versionName = buildDate
     }
 
     buildTypes {
@@ -44,7 +51,7 @@ android {
 }
 
 dependencies {
-    val composeBom = platform("androidx.compose:compose-bom:2024.02.01")
+    val composeBom = platform("androidx.compose:compose-bom:2025.06.01")
     implementation(composeBom)
     androidTestImplementation(composeBom)
 
@@ -54,7 +61,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
 
     // Standard Material3 (works on both Wear OS watches and phones/tablets)
-    implementation("androidx.compose.material3:material3")
+    // 1.5.0-alpha14：官方 Material 3 Expressive API 已公开（MaterialExpressiveTheme / MotionScheme），
+    // 且仍依赖 compose-ui 1.8.2，故无需提升 compileSdk / AGP
+    implementation("androidx.compose.material3:material3:1.5.0-alpha14")
     implementation("androidx.compose.material:material-icons-core")
     implementation("androidx.compose.material:material-icons-extended")
 

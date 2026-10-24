@@ -1,15 +1,53 @@
 // ==================== 服务器信息模块 ====================
 // 关于页面信息：服务器名称、描述、公告、版权、Logo 等
 
+const fs = require('fs');
+const path = require('path');
 const storage = require('./storage');
 const auth = require('./auth');
 const multipart = require('./multipart');
 
+// 服务器版本号：取 server.js 的修改日期（yyyyMMdd），无文件时用当天日期
+function computeServerVersion() {
+  try {
+    const stat = fs.statSync(path.join(__dirname, '..', 'server.js'));
+    const d = new Date(stat.mtime);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}${m}${day}`;
+  } catch (_) {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}${m}${day}`;
+  }
+}
+
+const SERVER_VERSION = computeServerVersion();
+
 /**
  * 获取服务器信息（对外公开）
  */
-function getServerInfo() {
+function getServerInfo(req) {
   const info = storage.read('serverInfo');
+  // 协议：根据当前请求推断（ws / wss）
+  let protocol = 'ws';
+  try {
+    if (req && req.headers) {
+      const xfProto = req.headers['x-forwarded-proto'];
+      if (xfProto === 'https' || xfProto === 'wss') protocol = 'wss';
+    }
+  } catch (_) {}
+  // 服务器对外地址：优先从 Host 头取
+  let address = '';
+  try {
+    if (req && req.headers && req.headers.host) {
+      address = req.headers.host;
+    }
+  } catch (_) {}
+
   return {
     serverName: info.serverName,
     serverDescription: info.serverDescription,
@@ -18,7 +56,11 @@ function getServerInfo() {
     logo: info.logo,
     logoType: info.logoType,
     logoEmoji: info.logoEmoji,
-    updatedAt: info.updatedAt
+    updatedAt: info.updatedAt,
+    // 新增：版本 / 协议 / 地址
+    serverVersion: SERVER_VERSION,
+    serverProtocol: protocol,
+    serverAddress: address
   };
 }
 

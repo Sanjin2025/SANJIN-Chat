@@ -43,6 +43,13 @@ class SanjinChatApp : Application() {
     @Volatile
     var activeConversation: String? = null
 
+    /**
+     * 自动登录（cookie 恢复）失败时给登录页的一次性提示，例如"登录已过期，请重新登录"。
+     * 登录页读取后立即清空，保证只提示一次。
+     */
+    @Volatile
+    var pendingLoginNotice: String? = null
+
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var notificationJob: Job? = null
 
@@ -56,7 +63,7 @@ class SanjinChatApp : Application() {
         messageCache = MessageCache(this)
 
         // 默认使用固定服务器地址 + ws 协议，用户可在主界面「高级设置」修改
-        val defaultAddress = "sanjin666.dpdns.org:8181"
+        val defaultAddress = "sanjinx.com"
         val defaultProtocol = "ws"
         val savedAddress = runBlocking { preferenceManager.serverAddress.first() }
         val savedProtocol = runBlocking { preferenceManager.serverProtocol.first() }
@@ -74,19 +81,17 @@ class SanjinChatApp : Application() {
         val keepAlive = runBlocking { preferenceManager.keepAlive.first() }
         if (keepAlive) ensureKeepAliveService(start = true)
 
-        // 杀后台后冷启动恢复：有 token 时自动重连 WS + 恢复 currentUser
+        // 杀后台后冷启动：先用本地保存的登录信息填充 currentUser，保证 WS 连上前 ChatScreen 就能正确判断消息归属
+        // 注意：token 校验与 WebSocket 连接统一交给 BootScreen 的自动登录流程，这里不再 connect，
+        // 避免 Application 与启动页两个 connect 互相关闭对方 socket（之前"卡在连接中"的根因之一）
         appScope.launch {
             val token = preferenceManager.token.first()
             if (!token.isNullOrBlank()) {
-                // 1. 先从 HTTP 恢复 currentUser（WS 连上前 ChatScreen 就可用）
                 val savedUserId = preferenceManager.userId.first()
                 val savedUsername = preferenceManager.username.first()
                 val savedNickname = preferenceManager.nickname.first()
-                val profileUser = runCatching { apiClient.getMyProfile(token).getOrNull() }.getOrNull()
-                if (profileUser != null) {
-                    webSocketClient.setCurrentUser(profileUser)
-                } else if (!savedUserId.isNullOrBlank()) {
-                    // HTTP 失败：用 PreferenceManager 保存的信息构造一个最小 User（足够判断 isSelf）
+                if (!savedUserId.isNullOrBlank()) {
+                    // 用本地保存的信息构造最小 User（足够判断 isSelf），不发起网络请求
                     webSocketClient.setCurrentUser(com.sanjinchat.wear.model.User(
                         id = savedUserId,
                         username = savedUsername ?: "",
@@ -98,10 +103,8 @@ class SanjinChatApp : Application() {
                         createdAt = 0L
                     ))
                 }
-                // 2. 自动连接 WebSocket
-                webSocketClient.connect(token)
-                // 3. 从云端同步最近 10 天消息到本地缓存，并清理本地过期消息
-                val myId = profileUser?.id ?: savedUserId
+                // 从云端同步最近 10 天消息到本地缓存，并清理本地过期消息
+                val myId = savedUserId
                 if (!myId.isNullOrBlank()) {
                     runCatching { apiClient.syncMessages(token).getOrNull() }
                         .getOrNull()

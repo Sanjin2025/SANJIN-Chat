@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 应用内更新：下载到外部缓存目录的 APK 可通过 FileProvider 共享给系统安装器 -->
+    <external-cache-path
+        name="external_cache"
+        path="." />
+    <cache-path
+        name="cache"
+        path="." />
+</paths>

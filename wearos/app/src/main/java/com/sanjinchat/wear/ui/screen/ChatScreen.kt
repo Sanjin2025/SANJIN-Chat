@@ -465,11 +465,12 @@ fun ChatScreen(
             }
 
             // 录音中的浮层提示：Expressive 形变进入/退出
-            AnimatedVisibility(
+            androidx.compose.animation.AnimatedVisibility(
                 visible = isRecording,
                 enter = ExpressiveMotion.EnterExpand,
                 exit = ExpressiveMotion.ExitShrink,
-                modifier = Modifier.align(Alignment.Center)
+                modifier = Modifier.align(Alignment.Center),
+                label = "recordingOverlay"
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Card(

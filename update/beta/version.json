@@ -1,0 +1,10 @@
+{
+  "versionCode": 20261026,
+  "versionName": "20261026-beta",
+  "apkUrl": "sanjinchat-wear.apk",
+  "changelog": "[Beta] 1. 测试版更新通道\n2. 可在设置中切换回 stable",
+  "channel": "beta",
+  "minSdk": 26,
+  "forceUpdate": false,
+  "releasedAt": "2026-10-26"
+}
