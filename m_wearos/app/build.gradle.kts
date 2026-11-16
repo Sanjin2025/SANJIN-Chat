@@ -93,4 +93,7 @@ dependencies {
 
     // ZXing barcode scanner（扫码登录）
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
+    // WebRTC（语音/视频通话）
+    implementation("io.github.webrtc-sdk:android:125.6422.07")
 }

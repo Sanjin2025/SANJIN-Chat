@@ -50,6 +50,19 @@ sealed class ChatEvent {
     data class FriendRequestsUpdate(val requests: List<FriendRequest>) : ChatEvent()
     data class PresenceUpdate(val statuses: Map<String, String>) : ChatEvent()
     data class Error(val message: String) : ChatEvent()
+
+    // ===== 音视频通话信令 =====
+    data class CallInvite(val fromId: String, val fromNickname: String, val media: String) : ChatEvent()
+    data class CallRinging(val toId: String) : ChatEvent()
+    data class CallAnswer(val fromId: String, val accept: Boolean, val media: String) : ChatEvent()
+    data class CallSdp(val fromId: String, val sdpType: String, val sdp: String) : ChatEvent()
+    data class CallIce(
+        val fromId: String,
+        val sdpMid: String?,
+        val sdpMLineIndex: Int,
+        val candidate: String
+    ) : ChatEvent()
+    data class CallEnd(val fromId: String, val reason: String) : ChatEvent()
 }
 
 class ChatWebSocketClient {
@@ -121,10 +134,30 @@ class ChatWebSocketClient {
     private val _friendRequests = MutableStateFlow<List<FriendRequest>>(emptyList())
     val friendRequests: StateFlow<List<FriendRequest>> = _friendRequests.asStateFlow()
 
+    // 未读消息数：key 为会话标识（MessageCache.privateConvId / groupConvId）
+    private val _unread = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val unread: StateFlow<Map<String, Int>> = _unread.asStateFlow()
+
+    /** 收到不属于当前正在查看会话的消息时累加未读数 */
+    fun bumpUnread(convId: String) {
+        _unread.value = _unread.value.toMutableMap().apply {
+            this[convId] = (this[convId] ?: 0) + 1
+        }
+    }
+
+    /** 进入会话后清除未读 */
+    fun clearUnread(convId: String) {
+        val cur = _unread.value
+        if (cur.containsKey(convId)) {
+            _unread.value = cur.toMutableMap().apply { remove(convId) }
+        }
+    }
+
     // 允许 MainScreen 在 WS 推送前，先通过 HTTP 拉取结果直接填充列表
     fun setFriendsSnapshot(list: List<Friend>) { _friends.value = list }
     fun setGroupsSnapshot(list: List<GroupMembership>) { _groups.value = list }
     fun setFriendRequestsSnapshot(list: List<FriendRequest>) { _friendRequests.value = list }
+
     /** HTTP fallback：WS 未连上时也能设置当前用户，供 ChatScreen 判断消息归属 */
     fun setCurrentUser(user: User) {
         if (_currentUser.value == null) _currentUser.value = user
@@ -315,6 +348,70 @@ class ChatWebSocketClient {
                         _connectionState.value = ConnectionState.Error(msg)
                         runCatching { _events.emit(ChatEvent.Error(msg)) }
                     }
+                    "call:invite" -> {
+                        runCatching {
+                            _events.emit(
+                                ChatEvent.CallInvite(
+                                    fromId = json.optString("fromId"),
+                                    fromNickname = json.optString("fromNickname", "对方"),
+                                    media = json.optString("media", "audio")
+                                )
+                            )
+                        }
+                    }
+                    "call:ringing" -> {
+                        runCatching { _events.emit(ChatEvent.CallRinging(json.optString("toId"))) }
+                    }
+                    "call:answer" -> {
+                        runCatching {
+                            _events.emit(
+                                ChatEvent.CallAnswer(
+                                    fromId = json.optString("fromId"),
+                                    accept = json.optBoolean("accept", false),
+                                    media = json.optString("media", "audio")
+                                )
+                            )
+                        }
+                    }
+                    "call:sdp" -> {
+                        val sdpObj = json.optJSONObject("sdp")
+                        if (sdpObj != null) {
+                            runCatching {
+                                _events.emit(
+                                    ChatEvent.CallSdp(
+                                        fromId = json.optString("fromId"),
+                                        sdpType = sdpObj.optString("type", "offer"),
+                                        sdp = sdpObj.optString("sdp", "")
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    "call:ice" -> {
+                        val c = json.optJSONObject("candidate")
+                        if (c != null) {
+                            runCatching {
+                                _events.emit(
+                                    ChatEvent.CallIce(
+                                        fromId = json.optString("fromId"),
+                                        sdpMid = if (c.isNull("sdpMid")) null else c.optString("sdpMid"),
+                                        sdpMLineIndex = c.optInt("sdpMLineIndex", 0),
+                                        candidate = c.optString("candidate", "")
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    "call:end" -> {
+                        runCatching {
+                            _events.emit(
+                                ChatEvent.CallEnd(
+                                    fromId = json.optString("fromId"),
+                                    reason = json.optString("reason", "hangup")
+                                )
+                            )
+                        }
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -369,6 +466,17 @@ class ChatWebSocketClient {
         return send(msg.toString())
     }
 
+    fun sendPrivateVideo(toId: String, videoUrl: String): Boolean {
+        val msg = JSONObject().apply {
+            put("type", "private_message")
+            put("toId", toId)
+            put("contentType", "video")
+            put("content", "[视频]")
+            put("video", videoUrl)
+        }
+        return send(msg.toString())
+    }
+
     fun sendGroupMessage(groupId: String, content: String): Boolean {
         val msg = JSONObject().apply {
             put("type", "group_message")
@@ -401,6 +509,76 @@ class ChatWebSocketClient {
             put("contentType", "audio")
             put("content", "[语音 ${durationSec}s]")
             put("audio", audio.toString())
+        }
+        return send(msg.toString())
+    }
+
+    fun sendGroupVideo(groupId: String, videoUrl: String): Boolean {
+        val msg = JSONObject().apply {
+            put("type", "group_message")
+            put("groupId", groupId)
+            put("contentType", "video")
+            put("content", "[视频]")
+            put("video", videoUrl)
+        }
+        return send(msg.toString())
+    }
+
+    // ==================================================================
+    //  音视频通话信令
+    // ==================================================================
+
+    fun sendCallInvite(toId: String, media: String): Boolean {
+        val msg = JSONObject().apply {
+            put("type", "call:invite")
+            put("toId", toId)
+            put("media", if (media == "video") "video" else "audio")
+        }
+        return send(msg.toString())
+    }
+
+    fun sendCallAnswer(toId: String, accept: Boolean, media: String): Boolean {
+        val msg = JSONObject().apply {
+            put("type", "call:answer")
+            put("toId", toId)
+            put("accept", accept)
+            put("media", if (media == "video") "video" else "audio")
+        }
+        return send(msg.toString())
+    }
+
+    fun sendCallEnd(toId: String, reason: String): Boolean {
+        val msg = JSONObject().apply {
+            put("type", "call:end")
+            put("toId", toId)
+            put("reason", reason)
+        }
+        return send(msg.toString())
+    }
+
+    fun sendCallSdp(toId: String, sdpType: String, sdp: String): Boolean {
+        val sdpObj = JSONObject().apply {
+            put("type", sdpType)
+            put("sdp", sdp)
+        }
+        val msg = JSONObject().apply {
+            put("type", "call:sdp")
+            put("toId", toId)
+            put("sdp", sdpObj)
+        }
+        return send(msg.toString())
+    }
+
+    fun sendCallIce(toId: String, sdpMid: String?, sdpMLineIndex: Int, candidate: String): Boolean {
+        val cand = JSONObject().apply {
+            put("sdpMid", sdpMid ?: "0")
+            put("sdpMLineIndex", sdpMLineIndex)
+            put("candidate", candidate)
+        }
+        val msg = JSONObject().apply {
+            put("type", "call:ice")
+            put("toId", toId)
+            put("candidate", cand)
         }
         return send(msg.toString())
     }

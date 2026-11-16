@@ -812,7 +812,8 @@ class ChatServer {
       contentType: msg.contentType || 'text',
       content: msg.content || '',
       image: msg.image || null,
-      audio: msg.audio || null
+      audio: msg.audio || null,
+      video: msg.video || null
     });
 
     this._sendToUser(user.id, { type: 'private_message', message: saved, timestamp: Date.now() });
@@ -841,7 +842,8 @@ class ChatServer {
       contentType: msg.contentType || 'text',
       content: msg.content || '',
       image: msg.image || null,
-      audio: msg.audio || null
+      audio: msg.audio || null,
+      video: msg.video || null
     });
 
     this._broadcastToGroupMembers(groupId, {
@@ -864,6 +866,7 @@ class ChatServer {
       content: data.content || '',
       image: data.image || null,
       audio: data.audio || null,
+      video: data.video || null,
       timestamp: Date.now()
     };
     messages.push(msg);
@@ -979,8 +982,76 @@ class ChatServer {
       'group:set_admin': this._handleGroupSetAdmin,
       'group:kick': this._handleGroupKick,
       'group:mute': this._handleGroupMute,
-      'group:unmute': this._handleGroupUnmute
+      'group:unmute': this._handleGroupUnmute,
+      'call:invite': this._handleCallInvite,
+      'call:answer': this._handleCallAnswer,
+      'call:end': this._handleCallEnd,
+      'call:sdp': this._handleCallSignal,
+      'call:ice': this._handleCallSignal
     };
+  }
+
+  // ==================== 音视频通话信令 ====================
+
+  /** 主叫发起通话邀请 */
+  async _handleCallInvite(user, msg) {
+    const { toId, media } = msg;
+    if (!toId || toId === user.id) throw new Error('无效的通话对象');
+    if (!auth.getUserById(toId)) throw new Error('目标用户不存在');
+    this._sendToUser(toId, {
+      type: 'call:invite',
+      fromId: user.id,
+      fromNickname: user.nickname,
+      media: media === 'video' ? 'video' : 'audio',
+      timestamp: Date.now()
+    });
+    // 回执给主叫，确认已送达
+    this._sendToUser(user.id, {
+      type: 'call:ringing',
+      toId,
+      timestamp: Date.now()
+    });
+  }
+
+  /** 被叫接听 / 拒接 */
+  async _handleCallAnswer(user, msg) {
+    const { toId, accept, media } = msg;
+    if (!toId) throw new Error('缺少 toId');
+    this._sendToUser(toId, {
+      type: 'call:answer',
+      fromId: user.id,
+      fromNickname: user.nickname,
+      accept: !!accept,
+      media: media === 'video' ? 'video' : 'audio',
+      timestamp: Date.now()
+    });
+  }
+
+  /** 任意一方挂断 */
+  async _handleCallEnd(user, msg) {
+    const { toId, reason } = msg;
+    if (!toId) return;
+    this._sendToUser(toId, {
+      type: 'call:end',
+      fromId: user.id,
+      reason: reason || 'hangup',
+      timestamp: Date.now()
+    });
+  }
+
+  /** SDP / ICE 透传（WebRTC 协商） */
+  async _handleCallSignal(user, msg) {
+    const { toId } = msg;
+    if (!toId) throw new Error('缺少 toId');
+    const payload = {
+      type: msg.type,
+      fromId: user.id,
+      timestamp: Date.now()
+    };
+    if (msg.sdp != null) payload.sdp = msg.sdp;
+    if (msg.kind != null) payload.kind = msg.kind;
+    if (msg.candidate != null) payload.candidate = msg.candidate;
+    this._sendToUser(toId, payload);
   }
 }
 

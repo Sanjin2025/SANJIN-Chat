@@ -118,6 +118,24 @@ a { color: var(--md-primary); text-decoration: none; }
 .msg-bubble .sender-name { font-size: 11px; color: var(--md-primary); font-weight: 600; margin-bottom: 2px; }
 .msg-row.me .msg-bubble .sender-name { display: none; }
 .msg-bubble img { max-width: 200px; max-height: 250px; border-radius: 12px; display: block; cursor: pointer; }
+.msg-bubble video { max-width: 220px; max-height: 260px; border-radius: 12px; display: block; background: #000; }
+/* ===== 音视频通话 ===== */
+.call-overlay { position: fixed; inset: 0; background: radial-gradient(circle at 50% 20%, #2b2434, #0e0c12 72%); z-index: 450; display: flex; flex-direction: column; align-items: center; justify-content: space-between; padding: 36px 20px calc(36px + var(--safe-bottom)); color: #fff; animation: fadeIn 0.2s; overflow: hidden; }
+.call-overlay .call-video-wrap { position: absolute; inset: 0; background: #000; }
+.call-overlay .call-remote-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
+.call-overlay .call-local-video { position: absolute; right: 16px; top: 20px; width: 104px; height: 140px; object-fit: cover; border-radius: 12px; background: #111; box-shadow: var(--md-shadow-3); z-index: 2; }
+.call-overlay .call-info { position: relative; z-index: 3; display: flex; flex-direction: column; align-items: center; text-align: center; margin-top: 24px; }
+.call-overlay .peer-avatar { width: 96px; height: 96px; border-radius: 50%; background: var(--md-primary-container); color: var(--md-on-primary-container); display: flex; align-items: center; justify-content: center; font-size: 46px; overflow: hidden; box-shadow: var(--md-shadow-3); }
+.call-overlay .peer-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.call-overlay .peer-name { font-size: 24px; font-weight: 600; margin-top: 16px; }
+.call-overlay .call-status { font-size: 15px; opacity: 0.78; margin-top: 6px; }
+.call-overlay .call-actions { position: relative; z-index: 3; display: flex; gap: 32px; align-items: center; }
+.call-overlay .call-btn { width: 64px; height: 64px; border-radius: 50%; border: none; font-size: 26px; cursor: pointer; background: rgba(255,255,255,0.16); color: #fff; display: inline-flex; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+.call-overlay .call-btn.accept { background: #2E7D32; }
+.call-overlay .call-btn.hangup { background: var(--md-error); }
+.call-overlay .call-btn.muted { background: rgba(255,255,255,0.42); }
+.call-overlay.video-mode .peer-avatar, .call-overlay.video-mode .peer-name { display: none; }
+.call-overlay.video-mode .call-status { background: rgba(0,0,0,0.45); padding: 4px 12px; border-radius: var(--md-radius-full); }
 .audio-msg { display: flex; align-items: center; gap: 10px; padding: 6px 4px; min-width: 120px; }
 .audio-msg .play-btn { width: 36px; height: 36px; border-radius: var(--md-radius-full); border: none; background: rgba(255,255,255,0.3); color: inherit; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; }
 .audio-msg .duration { font-size: 12px; opacity: 0.85; }
@@ -214,7 +232,8 @@ a { color: var(--md-primary); text-decoration: none; }
 (function () {
   'use strict';
   const state = {
-    server: localStorage.getItem('sanjin_server') || 'your-server.com:8181',
+    // 默认用当前访问页面的 host（含端口），保证网页端开箱即用；用户仍可在登录页/设置页修改
+    server: localStorage.getItem('sanjin_server') || (typeof window !== 'undefined' && window.location ? window.location.host : '') || 'chat.sanjinx.com:8181',
     token: localStorage.getItem('sanjin_token') || '',
     me: null,
     ws: null, wsReconnectTimer: null,
@@ -365,7 +384,7 @@ a { color: var(--md-primary); text-decoration: none; }
     const sf = $el('div', { class: 'field' });
     const sIn = $el('input', { id: 'login-server', value: state.server, placeholder: ' ' });
     sf.append(sIn, $el('label', { for: 'login-server' }, '服务器地址'));
-    sIn.onchange = () => { state.server = sIn.value.trim() || 'your-server.com:8181'; localStorage.setItem('sanjin_server', state.server); };
+    sIn.onchange = () => { state.server = sIn.value.trim() || 'chat.sanjinx.com:8181'; localStorage.setItem('sanjin_server', state.server); };
     card.appendChild(sf);
     const tabs = $el('div', { class: 'login-tabs' });
     const bAcc = $el('button', { class: 'active' }, '账密登录');
@@ -556,6 +575,226 @@ a { color: var(--md-primary); text-decoration: none; }
     state.wsReconnectTimer = setTimeout(() => { state.wsReconnectTimer = null; if (state.token) connectWebSocket(); }, 3000);
   }
   function wsSend(o) { if (state.ws && state.ws.readyState === 1) { state.ws.send(JSON.stringify(o)); return true; } return false; }
+  // ================= 音视频通话（WebRTC + WS 信令） =================
+  const call = {
+    peerId: null, peerName: null, peerUser: null, media: 'audio',
+    pc: null, localStream: null, remoteStream: null,
+    direction: null, state: 'idle', pendingOffer: null, pendingIce: [],
+    timer: null, seconds: 0, mute: false, camOff: false,
+    iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }]
+  };
+  function callSupported() {
+    return !!(window.RTCPeerConnection && navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  }
+  function callStatus(txt) { const el = document.getElementById('call-status-text'); if (el) el.textContent = txt; }
+  function fmtDur(s) { return padZ(Math.floor(s / 60)) + ':' + padZ(s % 60); }
+  function showCallUI(mode) {
+    closeCallUI();
+    const isVideo = call.media === 'video';
+    const ov = $el('div', { class: 'call-overlay' + (isVideo ? ' video-mode' : ''), id: 'call-overlay' });
+    if (isVideo) {
+      const wrap = $el('div', { class: 'call-video-wrap' });
+      const rv = $el('video', { class: 'call-remote-video', id: 'call-remote-video', autoplay: '', playsinline: '' });
+      wrap.appendChild(rv); ov.appendChild(wrap);
+    }
+    // 音频/视频统一用 audio 元素承接远端音轨，保证语音通话也有声音
+    const ra = $el('audio', { id: 'call-remote-audio', autoplay: '' }); ra.style.display = 'none'; ov.appendChild(ra);
+    if (isVideo) ov.appendChild($el('video', { class: 'call-local-video', id: 'call-local-video', autoplay: '', playsinline: '', muted: '' }));
+    const info = $el('div', { class: 'call-info' });
+    info.appendChild(renderAvatarEl(call.peerUser || { nickname: call.peerName }, 'lg'));
+    info.lastChild.className = 'peer-avatar';
+    info.appendChild($el('div', { class: 'peer-name' }, call.peerName || '未知用户'));
+    info.appendChild($el('div', { class: 'call-status', id: 'call-status-text' },
+      mode === 'in' ? (isVideo ? '邀请你视频通话' : '邀请你语音通话') : '正在呼叫...'));
+    ov.appendChild(info);
+    const actions = $el('div', { class: 'call-actions' });
+    if (mode === 'in') {
+      const reject = $el('button', { class: 'call-btn hangup', title: '拒绝' }, '✕');
+      reject.onclick = () => endCall(true, 'rejected');
+      const accept = $el('button', { class: 'call-btn accept', title: '接听' }, isVideo ? '🎥' : '📞');
+      accept.onclick = () => acceptCall();
+      actions.append(reject, accept);
+    } else {
+      const muteBtn = $el('button', { class: 'call-btn', id: 'call-mute-btn', title: '静音' }, '🎙️');
+      muteBtn.onclick = toggleMute; actions.appendChild(muteBtn);
+      if (isVideo) {
+        const camBtn = $el('button', { class: 'call-btn', id: 'call-cam-btn', title: '摄像头' }, '📷');
+        camBtn.onclick = toggleCam; actions.appendChild(camBtn);
+      }
+      const hang = $el('button', { class: 'call-btn hangup', title: '挂断' }, '📴');
+      hang.onclick = () => endCall(true, 'hangup');
+      actions.appendChild(hang);
+    }
+    ov.appendChild(actions);
+    document.body.appendChild(ov);
+    // 回填已获取/已收到的媒体流
+    if (call.remoteStream) {
+      const rv = document.getElementById('call-remote-video'); if (rv) { rv.srcObject = call.remoteStream; rv.play().catch(() => {}); }
+      const ra2 = document.getElementById('call-remote-audio'); if (ra2) { ra2.srcObject = call.remoteStream; ra2.play().catch(() => {}); }
+    }
+    if (call.localStream) {
+      const lv = document.getElementById('call-local-video'); if (lv) { lv.srcObject = call.localStream; lv.play().catch(() => {}); }
+    }
+  }
+  function closeCallUI() { const ov = document.getElementById('call-overlay'); if (ov) ov.remove(); }
+  function createPC() {
+    const pc = new RTCPeerConnection({ iceServers: call.iceServers });
+    pc.onicecandidate = (e) => {
+      if (e.candidate && call.peerId) callSend({ type: 'call:ice', toId: call.peerId, candidate: e.candidate.toJSON ? e.candidate.toJSON() : e.candidate });
+    };
+    pc.ontrack = (e) => {
+      if (!call.remoteStream) call.remoteStream = new MediaStream();
+      call.remoteStream.addTrack(e.track);
+      const rv = document.getElementById('call-remote-video');
+      const ra = document.getElementById('call-remote-audio');
+      if (rv) { rv.srcObject = call.remoteStream; rv.play().catch(() => {}); }
+      if (ra) { ra.srcObject = call.remoteStream; ra.play().catch(() => {}); }
+      markCallActive();
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') markCallActive();
+      else if (pc.connectionState === 'failed') { toast('通话连接失败', 'error'); endCall(true, 'failed'); }
+    };
+    call.pc = pc;
+    return pc;
+  }
+  function callSend(o) { wsSend(o); }
+  function markCallActive() {
+    if (call.state === 'active') return;
+    call.state = 'active';
+    call.seconds = 0;
+    callStatus('通话中 00:00');
+    if (call.timer) clearInterval(call.timer);
+    call.timer = setInterval(() => {
+      call.seconds++;
+      callStatus('通话中 ' + fmtDur(call.seconds));
+    }, 1000);
+  }
+  async function startCall(user, media) {
+    if (!callSupported()) return toast('当前浏览器不支持通话', 'error');
+    if (call.state !== 'idle') return toast('正在通话中', 'error');
+    call.peerId = user.id;
+    call.peerName = user.nickname || user.username || '对方';
+    call.peerUser = user;
+    call.media = media === 'video' ? 'video' : 'audio';
+    call.direction = 'out'; call.state = 'ringing';
+    call.remoteStream = null; call.pendingOffer = null; call.pendingIce = [];
+    showCallUI('out');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: call.media === 'video' });
+      if (call.state === 'idle') { stream.getTracks().forEach(t => t.stop()); return; }
+      call.localStream = stream;
+      const lv = document.getElementById('call-local-video'); if (lv) { lv.srcObject = stream; lv.play().catch(() => {}); }
+      const pc = createPC();
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+      callSend({ type: 'call:invite', toId: call.peerId, media: call.media });
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      callSend({ type: 'call:sdp', toId: call.peerId, sdp: { type: offer.type, sdp: offer.sdp } });
+    } catch (e) {
+      toast('无法开始通话：' + e.message, 'error');
+      endCall(true, 'error');
+    }
+  }
+  async function acceptCall() {
+    if (!call.peerId) return;
+    call.state = 'connecting';
+    callStatus('正在接通...');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: call.media === 'video' });
+      call.localStream = stream;
+      const lv = document.getElementById('call-local-video'); if (lv) { lv.srcObject = stream; lv.play().catch(() => {}); }
+      const pc = createPC();
+      stream.getTracks().forEach(t => pc.addTrack(t, stream));
+      showCallUI('out'); // 切换到通话中界面（保留媒体流）
+      callSend({ type: 'call:answer', toId: call.peerId, accept: true, media: call.media });
+      if (call.pendingOffer) {
+        await pc.setRemoteDescription(call.pendingOffer);
+        call.pendingOffer = null;
+        for (const c of call.pendingIce) { try { await pc.addIceCandidate(c); } catch (e) {} }
+        call.pendingIce = [];
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        callSend({ type: 'call:sdp', toId: call.peerId, sdp: { type: answer.type, sdp: answer.sdp } });
+      }
+    } catch (e) {
+      toast('接听失败：' + e.message, 'error');
+      endCall(true, 'error');
+    }
+  }
+  function toggleMute() {
+    if (!call.localStream) return;
+    call.mute = !call.mute;
+    call.localStream.getAudioTracks().forEach(t => { t.enabled = !call.mute; });
+    const b = document.getElementById('call-mute-btn');
+    if (b) { b.textContent = call.mute ? '🔇' : '🎙️'; b.classList.toggle('muted', call.mute); }
+  }
+  function toggleCam() {
+    if (!call.localStream) return;
+    call.camOff = !call.camOff;
+    call.localStream.getVideoTracks().forEach(t => { t.enabled = !call.camOff; });
+    const b = document.getElementById('call-cam-btn');
+    if (b) { b.textContent = call.camOff ? '🚫' : '📷'; b.classList.toggle('muted', call.camOff); }
+  }
+  function endCall(notify, reason) {
+    if (notify && call.peerId) callSend({ type: 'call:end', toId: call.peerId, reason: reason || 'hangup' });
+    cleanupCall();
+  }
+  function cleanupCall() {
+    if (call.timer) { clearInterval(call.timer); call.timer = null; }
+    if (call.pc) {
+      try { call.pc.onicecandidate = null; call.pc.ontrack = null; call.pc.onconnectionstatechange = null; call.pc.close(); } catch (e) {}
+    }
+    if (call.localStream) call.localStream.getTracks().forEach(t => t.stop());
+    if (call.remoteStream) call.remoteStream.getTracks().forEach(t => t.stop());
+    Object.assign(call, {
+      peerId: null, peerName: null, peerUser: null, media: 'audio',
+      pc: null, localStream: null, remoteStream: null,
+      direction: null, state: 'idle', pendingOffer: null, pendingIce: [],
+      timer: null, seconds: 0, mute: false, camOff: false
+    });
+    closeCallUI();
+  }
+  function onCallInvite(m) {
+    if (!callSupported()) { callSend({ type: 'call:answer', toId: m.fromId, accept: false }); return; }
+    if (call.state !== 'idle') { callSend({ type: 'call:answer', toId: m.fromId, accept: false }); return toast('忙碌中，已自动拒接', 'error'); }
+    const f = state.friends.find(x => x.userId === m.fromId);
+    call.peerId = m.fromId;
+    call.peerName = m.fromNickname || (f && f.user && (f.user.nickname || f.user.username)) || '对方';
+    call.peerUser = (f && f.user) || { id: m.fromId, nickname: call.peerName };
+    call.media = m.media === 'video' ? 'video' : 'audio';
+    call.direction = 'in'; call.state = 'ringing';
+    call.remoteStream = null; call.pendingOffer = null; call.pendingIce = [];
+    showCallUI('in');
+  }
+  function onCallAnswer(m) {
+    if (m.fromId !== call.peerId) return;
+    if (!m.accept) { toast('对方已拒绝通话'); cleanupCall(); return; }
+    callStatus('对方已接听，正在接通...');
+  }
+  async function onCallSdp(m) {
+    if (m.fromId !== call.peerId || !m.sdp) return;
+    const sd = m.sdp;
+    if (sd.type === 'offer') {
+      if (!call.pc) { call.pendingOffer = sd; return; }
+      try {
+        await call.pc.setRemoteDescription(sd);
+        const ans = await call.pc.createAnswer();
+        await call.pc.setLocalDescription(ans);
+        callSend({ type: 'call:sdp', toId: call.peerId, sdp: { type: ans.type, sdp: ans.sdp } });
+      } catch (e) { toast('通话协商失败', 'error'); endCall(true, 'error'); }
+    } else if (sd.type === 'answer') {
+      if (!call.pc) return;
+      try { await call.pc.setRemoteDescription(sd); } catch (e) { return; }
+      for (const c of call.pendingIce) { try { await call.pc.addIceCandidate(c); } catch (e) {} }
+      call.pendingIce = [];
+    }
+  }
+  function onCallIce(m) {
+    if (m.fromId !== call.peerId || !m.candidate) return;
+    if (call.pc && call.pc.remoteDescription) { call.pc.addIceCandidate(m.candidate).catch(() => {}); }
+    else call.pendingIce.push(m.candidate);
+  }
   function handleWs(m) {
     switch (m.type) {
       case 'connected': state.me = m.user; break;
@@ -585,6 +824,17 @@ a { color: var(--md-primary); text-decoration: none; }
       case 'user:account_deleted': toast('对方已注销账号'); if (state.currentChat && m.userId === state.currentChat.id) closeChat(); break;
       case 'new_announcement': state.announcements.unshift(m.announcement); toast('新公告：' + m.announcement.title, 'success'); if (state.currentPage === 'main') render(); break;
       case 'pair:status_update': if (pairPageOpen) refreshPairPage(); break;
+      case 'call:invite': onCallInvite(m); break;
+      case 'call:ringing': if (call.state === 'ringing' && call.peerId === m.toId) callStatus('对方响铃中...'); break;
+      case 'call:answer': onCallAnswer(m); break;
+      case 'call:sdp': onCallSdp(m); break;
+      case 'call:ice': onCallIce(m); break;
+      case 'call:end':
+        if (call.peerId && (m.fromId === call.peerId || m.toId === call.peerId)) {
+          toast(m.reason === 'rejected' ? '对方拒绝了通话' : '通话已结束');
+          cleanupCall();
+        }
+        break;
       case 'error': toast(m.message || '操作失败', 'error'); break;
     }
   }
@@ -737,6 +987,7 @@ a { color: var(--md-primary); text-decoration: none; }
     if (m.contentType === 'text') return p + m.content;
     if (m.contentType === 'image') return p + '[图片]';
     if (m.contentType === 'audio') return p + '[语音]';
+    if (m.contentType === 'video') return p + '[视频]';
     return p + '[消息]';
   }
   // ================= 通讯录 Tab =================
@@ -831,6 +1082,7 @@ a { color: var(--md-primary); text-decoration: none; }
     list.appendChild(makeMI('🪧', '加入曝光板', '展示公开资料', openEditExposure));
     list.appendChild(makeMI('👥', '浏览曝光板', '发现新朋友', openExposureBoard));
     list.appendChild(makeMI('📢', '公告板', `${state.announcements.length} 条`, openAnnouncementBoard));
+    list.appendChild(makeMI('🖥️', '服务器设置', state.server, openServerSettings));
     list.appendChild(makeMI('ℹ️', '关于', state.serverInfo?.serverName || 'SanjinChat', openAboutPage));
     if (me.role === 'admin') {
       list.appendChild($el('div', { class: 'divider' }));
@@ -974,6 +1226,33 @@ a { color: var(--md-primary); text-decoration: none; }
       m.body.appendChild(it);
     });
   }
+  function openServerSettings() {
+    const m = makeModal('服务器设置', 'lg');
+    m.body.appendChild($el('div', { style: { fontSize: 13, color: 'var(--md-on-surface-variant)', marginBottom: 12 } }, '修改服务器地址与端口，保存后会重新连接。默认端口 8181'));
+    const raw = (state.server || '').replace(/^https?:\/\//, '');
+    let host = raw, port = '8181';
+    const hp = raw.match(/^(.*):(\d{1,5})$/);
+    if (hp) { host = hp[1]; port = hp[2]; }
+    const f1 = $el('div', { class: 'field' });
+    const hostIn = $el('input', { id: 'srv-host', value: host, placeholder: ' ', maxlength: 100 });
+    f1.append(hostIn, $el('label', { for: 'srv-host' }, '服务器地址（不含端口）')); m.body.appendChild(f1);
+    const f2 = $el('div', { class: 'field' });
+    const portIn = $el('input', { id: 'srv-port', value: port, placeholder: ' ', maxlength: 5, inputmode: 'numeric' });
+    portIn.addEventListener('input', () => { portIn.value = portIn.value.replace(/\D/g, ''); });
+    f2.append(portIn, $el('label', { for: 'srv-port' }, '端口（默认 8181）')); m.body.appendChild(f2);
+    const save = $el('button', { class: 'btn btn-filled btn-block' }, '保存并重连');
+    save.onclick = () => {
+      const h = hostIn.value.trim().replace(/\/+$/, '');
+      const p = parseInt(portIn.value, 10);
+      if (!h) return toast('服务器地址不能为空', 'error');
+      if (!Number.isFinite(p) || p <= 0 || p > 65535) return toast('端口无效（1-65535）', 'error');
+      state.server = h + ':' + p;
+      localStorage.setItem('sanjin_server', state.server);
+      toast('已保存，正在重连...', 'success');
+      m.close(); loadServerInfo(); connectWebSocket(); render();
+    };
+    m.body.appendChild(save);
+  }
   function openAboutPage() {
     const info = state.serverInfo || {}; const m = makeModal('关于', 'lg');
     const hd = $el('div', { class: 'about-header' });
@@ -986,6 +1265,50 @@ a { color: var(--md-primary); text-decoration: none; }
     const b = $el('div', { class: 'about-body' });
     if (info.serverAnnouncement) b.appendChild($el('div', { class: 'about-desc' }, info.serverAnnouncement));
     if (info.serverDescription) b.appendChild($el('div', { class: 'about-desc' }, info.serverDescription));
+    // 服务器信息
+    const infoBox = $el('div', { class: 'about-desc', style: { padding: '8px 16px' } });
+    [['服务器版本', info.serverVersion || '-'], ['连接协议', info.serverProtocol || '-'], ['服务器地址', info.serverAddress || state.server]]
+      .forEach(([k, v]) => {
+        const r = $el('div', { class: 'profile-info-row', style: { borderBottom: '1px solid var(--md-outline-variant)' } });
+        r.appendChild($el('span', { class: 'label' }, k));
+        r.appendChild($el('span', { class: 'value' }, v));
+        infoBox.appendChild(r);
+      });
+    b.appendChild(infoBox);
+    // 检查更新（stable / beta）
+    const upWrap = $el('div', { class: 'about-desc', style: { padding: '14px 16px' } });
+    upWrap.appendChild($el('div', { style: { fontWeight: 600, marginBottom: 8 } }, '客户端更新'));
+    const chRow = $el('div', { class: 'row', style: { marginBottom: 8 } });
+    const sel = $el('select', { style: { flex: 1, height: 40, borderRadius: 'var(--md-radius-sm)', border: '1px solid var(--md-outline)', background: 'transparent', padding: '0 8px' } });
+    ['stable', 'beta'].forEach(ch => {
+      const o = $el('option', { value: ch }, ch === 'stable' ? '稳定版 (stable)' : '测试版 (beta)');
+      if ((localStorage.getItem('sanjin_update_channel') || 'stable') === ch) o.selected = true;
+      sel.appendChild(o);
+    });
+    const chk = $el('button', { class: 'btn btn-tonal' }, '检查更新');
+    chRow.append(sel, chk); upWrap.appendChild(chRow);
+    const res = $el('div', { style: { fontSize: 13, color: 'var(--md-on-surface-variant)', whiteSpace: 'pre-wrap' } });
+    upWrap.appendChild(res);
+    chk.onclick = async () => {
+      const ch = sel.value;
+      localStorage.setItem('sanjin_update_channel', ch);
+      res.textContent = '检查中...';
+      try {
+        const r = await http('/api/update/check?channel=' + encodeURIComponent(ch));
+        if (!r.hasUpdate) { res.textContent = '暂无更新：' + (r.reason || '通道无版本文件'); return; }
+        res.innerHTML = '';
+        res.appendChild($el('div', {}, `最新版本：${r.versionName || '-'}（${r.channel || ch}）`));
+        if (r.releasedAt) res.appendChild($el('div', {}, '发布时间：' + formatDate(r.releasedAt)));
+        if (r.changelog) res.appendChild($el('div', { style: { marginTop: 4 } }, '更新内容：\n' + r.changelog));
+        const urls = r.apkUrl ? [(r.apkUrl.startsWith('http') ? r.apkUrl : apiBase() + r.apkUrl)] : [];
+        if (r.customUrl) urls.push(r.customUrl);
+        urls.forEach(u => {
+          const a = $el('a', { href: u, target: '_blank', class: 'btn btn-outline btn-block mt-16' }, '下载安装包');
+          res.appendChild(a);
+        });
+      } catch (e) { res.textContent = '检查更新失败：' + e.message; }
+    };
+    b.appendChild(upWrap);
     m.body.appendChild(b);
     m.body.appendChild($el('div', { class: 'copyright' }, info.copyright || '© 2026 SanjinChat'));
   }
@@ -1304,6 +1627,11 @@ a { color: var(--md-primary); text-decoration: none; }
       const onl = state.lastPresence[u.id] === 'online' || state.friends.find(f => f.userId === u.id)?.online;
       info.appendChild($el('div', { class: 'subtitle' }, onl ? '在线' : '离线'));
       header.appendChild(info);
+      const audioCallBtn = $el('button', { class: 'icon-btn', title: '语音通话' }, '📞');
+      audioCallBtn.onclick = () => startCall(u, 'audio');
+      const videoCallBtn = $el('button', { class: 'icon-btn', title: '视频通话' }, '🎥');
+      videoCallBtn.onclick = () => startCall(u, 'video');
+      header.append(audioCallBtn, videoCallBtn);
     } else {
       const g = state.currentChat.groupInfo;
       const av = $el('div', { class: 'avatar', style: { background: 'var(--md-secondary-container)', color: 'var(--md-on-primary-container)', fontSize: 20 } }, '👥');
@@ -1346,6 +1674,10 @@ a { color: var(--md-primary); text-decoration: none; }
     const imgInput = $el('input', { type: 'file', accept: 'image/*', class: 'hidden' }); bar.appendChild(imgInput);
     imgBtn.onclick = () => imgInput.click();
     imgInput.onchange = () => { const f = imgInput.files[0]; if (f) sendImageFile(f); imgInput.value = ''; };
+    const vidBtn = $el('button', { class: 'icon-btn', title: '发送视频（最大 10MB）' }, '🎬'); bar.appendChild(vidBtn);
+    const vidInput = $el('input', { type: 'file', accept: 'video/*', class: 'hidden' }); bar.appendChild(vidInput);
+    vidBtn.onclick = () => vidInput.click();
+    vidInput.onchange = () => { const f = vidInput.files[0]; if (f) sendVideoFile(f); vidInput.value = ''; };
     const inputWrap = $el('div', { class: 'input-wrap' });
     const tArea = $el('textarea', { placeholder: '输入消息...', rows: 1 });
     inputWrap.appendChild(tArea);
@@ -1444,6 +1776,28 @@ a { color: var(--md-primary); text-decoration: none; }
           toId: state.currentChat.type === 'private' ? state.currentChat.id : null,
           groupId: state.currentChat.type === 'group' ? state.currentChat.id : null,
           contentType: 'image', image: r.url, timestamp: Date.now()
+        };
+        const k2 = chatKey(state.currentChat.type, state.currentChat.id);
+        if (!state.chatMessages[k2]) state.chatMessages[k2] = [];
+        state.chatMessages[k2].push(msg);
+        appendMsgEl(msg); scrollChatBottom(); saveMsgCache();
+      } catch (e) { toast(e.message, 'error'); }
+    }
+
+    async function sendVideoFile(f) {
+      if (f.size > 10 * 1024 * 1024) return toast('视频大于 10MB，无法发送', 'error');
+      try {
+        const fd = new FormData(); fd.append('video', f);
+        toast('上传视频中...');
+        const r = await http('/upload/video', { method: 'POST', body: fd });
+        if (state.currentChat.type === 'private') wsSend({ type: 'private_message', toId: state.currentChat.id, contentType: 'video', content: '[视频]', video: r.url });
+        else wsSend({ type: 'group_message', groupId: state.currentChat.id, contentType: 'video', content: '[视频]', video: r.url });
+        const msg = {
+          id: 'local_' + Date.now(), type: state.currentChat.type === 'private' ? 'private_message' : 'group_message',
+          fromId: state.me.id, fromNickname: state.me.nickname,
+          toId: state.currentChat.type === 'private' ? state.currentChat.id : null,
+          groupId: state.currentChat.type === 'group' ? state.currentChat.id : null,
+          contentType: 'video', content: '[视频]', video: r.url, timestamp: Date.now()
         };
         const k2 = chatKey(state.currentChat.type, state.currentChat.id);
         if (!state.chatMessages[k2]) state.chatMessages[k2] = [];
@@ -1564,6 +1918,14 @@ a { color: var(--md-primary); text-decoration: none; }
       };
       audWrap.append(play, dur, prog);
       bub.appendChild(audWrap);
+    } else if (msg.contentType === 'video') {
+      const vurl = typeof msg.video === 'string' ? msg.video : (msg.video && msg.video.url ? msg.video.url : '');
+      if (vurl) {
+        const v = $el('video', { src: apiBase() + vurl, controls: '', playsinline: '', preload: 'metadata' });
+        bub.appendChild(v);
+      } else {
+        bub.appendChild($el('div', {}, '[视频]'));
+      }
     }
     bub.appendChild($el('div', { class: 'time' }, formatTime(msg.timestamp)));
     row.appendChild(bub);

@@ -1,10 +1,10 @@
 {
-  "versionCode": 20261025,
-  "versionName": "20261025",
-  "apkUrl": "sanjinchat-wear.apk",
-  "changelog": "1. 新增服务器信息页\n2. 新增客户端自动检查更新\n3. 支持 stable/beta/自定义通道切换\n4. 版本号改为编译日期格式",
+  "versionCode": 20261116,
+  "versionName": "20261116",
+  "apkUrl": "app-debug.apk",
+  "changelog": "修复联网首次进入配对码页面显示生成失败\n新增发送视频（限制 10MB）\n新增语音通话（手表端音频）\n消息输入框改为窄样式\n新增服务端端口与消息保留天数配置\n新增网页端：视频、音视频通话、服务器设置、检查更新",
   "channel": "stable",
   "minSdk": 26,
   "forceUpdate": false,
-  "releasedAt": "2026-10-25"
+  "releasedAt": "2026-11-16"
 }

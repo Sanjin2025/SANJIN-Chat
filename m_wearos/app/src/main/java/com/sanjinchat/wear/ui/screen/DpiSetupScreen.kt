@@ -101,7 +101,7 @@ fun DpiSetupScreen(navController: NavController) {
     val scope = rememberCoroutineScope()
 
     var step by remember { mutableIntStateOf(0) } // 0=服务器地址, 1=DPI
-    var serverAddr by remember { mutableStateOf("sanjin666.dpdns.org:8181") }
+    var serverAddr by remember { mutableStateOf("chat.sanjinx.com:8181") }
     var selected by remember { mutableFloatStateOf(1.0f) }
     var addrError by remember { mutableStateOf<String?>(null) }
 

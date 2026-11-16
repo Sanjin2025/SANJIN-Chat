@@ -47,6 +47,7 @@ data class ChatMessage(
     val content: String,
     val image: String? = null,
     val audio: String? = null,
+    val video: String? = null,
     val timestamp: Long
 )
 

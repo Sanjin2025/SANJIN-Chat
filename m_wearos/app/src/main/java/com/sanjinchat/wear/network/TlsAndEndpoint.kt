@@ -74,6 +74,37 @@ object ServerEndpoint {
             else -> s
         }
     }
+
+    /** 取出地址中的主机部分（不含端口）；无端口时原样返回 */
+    fun extractHost(raw: String): String {
+        val s = stripScheme(raw.trim()).removeSuffix("/")
+        if (s.startsWith('[')) {
+            val close = s.indexOf(']')
+            return if (close == -1) s else s.substring(0, close + 1)
+        }
+        val m = TRAILING_PORT.find(s) ?: return s
+        val port = m.groupValues[1].toIntOrNull() ?: return s
+        if (port !in 1..65535) return s
+        // 多冒号且末段 4+ 位数字，判定为 IPv6
+        if (s.count { it == ':' } >= 2 && m.groupValues[1].length >= 4) return s
+        return s.substring(0, m.range.first)
+    }
+
+    /** 取出地址中的端口；无合法端口时返回默认 8181 */
+    fun extractPort(raw: String): String {
+        val s = stripScheme(raw.trim()).removeSuffix("/")
+        if (s.startsWith('[')) {
+            val close = s.indexOf(']')
+            if (close == -1) return "8181"
+            val after = s.substring(close + 1)
+            return if (after.startsWith(':')) after.substring(1).takeIf { it.toIntOrNull() != null } ?: "8181" else "8181"
+        }
+        val m = TRAILING_PORT.find(s) ?: return "8181"
+        val port = m.groupValues[1].toIntOrNull() ?: return "8181"
+        if (port !in 1..65535) return "8181"
+        if (s.count { it == ':' } >= 2 && m.groupValues[1].length >= 4) return "8181"
+        return m.groupValues[1]
+    }
 }
 
 /**

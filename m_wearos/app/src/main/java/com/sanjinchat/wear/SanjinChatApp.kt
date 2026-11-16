@@ -14,8 +14,14 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+
+/** 通知点击后要打开的会话目标 */
+data class ChatTarget(val isGroup: Boolean, val id: String, val name: String)
 
 class SanjinChatApp : Application() {
 
@@ -34,6 +40,9 @@ class SanjinChatApp : Application() {
     lateinit var messageCache: MessageCache
         private set
 
+    lateinit var callManager: com.sanjinchat.wear.call.CallManager
+        private set
+
     /**
      * 当前正在查看的聊天会话标识：
      * - 私聊：friendId
@@ -50,6 +59,17 @@ class SanjinChatApp : Application() {
     @Volatile
     var pendingLoginNotice: String? = null
 
+    /** 本次进程是否已做过自动更新检查（Boot 与 Main 共用标记，避免重复弹窗） */
+    @Volatile
+    var updateCheckedThisSession: Boolean = false
+
+    // 点击通知后待打开的会话：由 MainActivity 写入，MainScreen 进入主界面后消费
+    private val _pendingChatTarget = MutableStateFlow<ChatTarget?>(null)
+    val pendingChatTarget: StateFlow<ChatTarget?> = _pendingChatTarget.asStateFlow()
+
+    fun requestOpenChat(target: ChatTarget) { _pendingChatTarget.value = target }
+    fun consumeChatTarget() { _pendingChatTarget.value = null }
+
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var notificationJob: Job? = null
 
@@ -61,12 +81,18 @@ class SanjinChatApp : Application() {
         webSocketClient = ChatWebSocketClient()
         notificationHelper = NotificationHelper(this)
         messageCache = MessageCache(this)
+        callManager = com.sanjinchat.wear.call.CallManager(this, webSocketClient)
 
         // 默认使用固定服务器地址 + ws 协议，用户可在主界面「高级设置」修改
-        val defaultAddress = "sanjinx.com"
+        val defaultAddress = "chat.sanjinx.com:8181"
         val defaultProtocol = "ws"
-        val savedAddress = runBlocking { preferenceManager.serverAddress.first() }
+        var savedAddress = runBlocking { preferenceManager.serverAddress.first() }
         val savedProtocol = runBlocking { preferenceManager.serverProtocol.first() }
+        // 一次性迁移：老版本把旧域名写进了 DataStore，仅改默认值不会生效，这里强制切到新服务器
+        if (savedAddress.contains("sanjin666.dpdns.org")) {
+            savedAddress = defaultAddress
+            runBlocking { preferenceManager.saveServerAddress(defaultAddress) }
+        }
         val address = savedAddress.takeUnless { it.isBlank() } ?: defaultAddress
         val protocol = savedProtocol.takeUnless { it.isBlank() } ?: defaultProtocol
         apiClient.serverAddress = address
@@ -185,6 +211,8 @@ class SanjinChatApp : Application() {
             while (true) {
                 try {
                     webSocketClient.events.collect { event ->
+                        // 通话信令交给 CallManager 处理
+                        runCatching { callManager.handleEvent(event) }
                         // 每条事件独立子协程 + runCatching 包裹，单条失败绝不打断后续 collect
                         launch {
                             runCatching {
@@ -197,12 +225,16 @@ class SanjinChatApp : Application() {
                                         messageCache.saveMessage(convId, msg)
                                         if (msg.fromId == cu) return@runCatching
                                         if (activeConversation != msg.fromId) {
+                                            webSocketClient.bumpUnread(convId)
                                             val sender = msg.fromNickname.ifBlank { msg.fromId }
                                             notificationHelper.showMessageNotification(
                                                 msg = msg,
                                                 senderName = sender,
-                                                conversationTag = msg.fromId
+                                                conversationTag = msg.fromId,
+                                                extraName = sender
                                             )
+                                        } else {
+                                            webSocketClient.clearUnread(convId)
                                         }
                                     }
                                     is ChatEvent.GroupMessage -> {
@@ -213,12 +245,21 @@ class SanjinChatApp : Application() {
                                         val cu = webSocketClient.currentUser.value?.id
                                         if (msg.fromId == cu) return@runCatching
                                         if (activeConversation != gid) {
+                                            webSocketClient.bumpUnread(convId)
                                             val sender = msg.fromNickname.ifBlank { msg.fromId }
+                                            // 群通知：标题显示群名，正文显示「发送者：内容」
+                                            val groupName = webSocketClient.groups.value
+                                                .firstOrNull { it.group.id == gid }?.group?.name
+                                                ?.takeIf { it.isNotBlank() } ?: "群聊"
                                             notificationHelper.showMessageNotification(
                                                 msg = msg,
-                                                senderName = sender,
-                                                conversationTag = gid
+                                                senderName = groupName,
+                                                conversationTag = gid,
+                                                bodySenderName = sender,
+                                                extraName = groupName
                                             )
+                                        } else {
+                                            webSocketClient.clearUnread(convId)
                                         }
                                     }
                                     else -> {}

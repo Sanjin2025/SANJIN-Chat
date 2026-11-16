@@ -91,6 +91,9 @@ class MainActivity : ComponentActivity() {
             window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         }
 
+        // 从通知点进来的：记录待打开会话，等主界面就绪后跳转
+        handleNotificationIntent(intent)
+
         setContent {
             val app = SanjinChatApp.instance
             val dpiScale by app.preferenceManager.dpiScale.collectAsState(initial = 1.0f)
@@ -104,10 +107,34 @@ class MainActivity : ComponentActivity() {
                         fontScale = dpiScale.coerceIn(0.5f, 2.0f)
                     )
                 ) {
-                    SanjinChatNavHost()
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        SanjinChatNavHost()
+                        com.sanjinchat.wear.ui.screen.CallOverlay()
+                    }
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotificationIntent(intent)
+    }
+
+    /** 解析通知携带的会话信息，交给 MainScreen 在进入主界面后跳转 */
+    private fun handleNotificationIntent(intent: android.content.Intent?) {
+        val tag = intent?.getStringExtra(com.sanjinchat.wear.notification.NotificationHelper.EXTRA_CONVERSATION_TAG)
+            ?: return
+        val isGroup = intent.getBooleanExtra(
+            com.sanjinchat.wear.notification.NotificationHelper.EXTRA_IS_GROUP, false
+        )
+        val name = intent.getStringExtra(
+            com.sanjinchat.wear.notification.NotificationHelper.EXTRA_CONVERSATION_NAME
+        ).orEmpty().ifBlank { tag }
+        SanjinChatApp.instance.requestOpenChat(ChatTarget(isGroup, tag, name))
+        // 清除，避免旋转/重建时重复跳转
+        intent.removeExtra(com.sanjinchat.wear.notification.NotificationHelper.EXTRA_CONVERSATION_TAG)
     }
 
     override fun onDestroy() {

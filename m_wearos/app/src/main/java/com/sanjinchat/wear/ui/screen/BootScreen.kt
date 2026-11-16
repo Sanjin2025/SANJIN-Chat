@@ -14,26 +14,19 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -70,16 +63,12 @@ import kotlinx.coroutines.withTimeoutOrNull
 fun BootScreen(navController: NavController) {
     val app = SanjinChatApp.instance
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
 
     var status by remember { mutableStateOf("正在恢复登录…") }
 
     // 自动更新检查相关状态
     var showUpdateDialog by remember { mutableStateOf(false) }
     var updateInfo by remember { mutableStateOf<ApiClient.AppUpdate?>(null) }
-    var downloading by remember { mutableStateOf(false) }
-    var downloadProgress by remember { mutableIntStateOf(0) }
-    var downloadError by remember { mutableStateOf<String?>(null) }
 
     val currentVersionCode = remember {
         runCatching {
@@ -114,8 +103,24 @@ fun BootScreen(navController: NavController) {
         val result = runCatching { app.apiClient.getMyProfile(token) }.getOrNull()
         val user = result?.getOrNull()
         if (user == null) {
-            // 校验失败：清掉失效的 cookie 并回登录页，绝不进入"假登录"的主界面
-            val reason = result?.exceptionOrNull()?.message?.takeIf { it.isNotBlank() } ?: "会话已失效"
+            val ex = result?.exceptionOrNull()
+            // 协程被取消（页面销毁等）时不做任何处理，避免误清登录态
+            if (ex is kotlinx.coroutines.CancellationException) return@LaunchedEffect
+
+            // 网络不可用（断网/DNS 失败/连接超时）不代表登录失效：
+            // 保留 token，用本地保存的用户信息进入离线模式，联网后自动重连
+            if (ex is java.io.IOException) {
+                val savedUserId = app.preferenceManager.userId.first()
+                if (!savedUserId.isNullOrBlank()) {
+                    navController.navigate("main") {
+                        popUpTo("boot") { inclusive = true }
+                    }
+                    return@LaunchedEffect
+                }
+            }
+
+            // 校验失败（token 过期/被拒）：清掉失效的 cookie 并回登录页，绝不进入"假登录"的主界面
+            val reason = ex?.message?.takeIf { it.isNotBlank() } ?: "会话已失效"
             app.preferenceManager.clearLoginInfo()
             runCatching { app.webSocketClient.disconnect() }
             app.pendingLoginNotice = "登录已过期，请重新登录（$reason）"
@@ -144,6 +149,7 @@ fun BootScreen(navController: NavController) {
 
         // 6. 登录后自动检查更新（失败不阻塞进入主界面）
         status = "正在检查更新…"
+        app.updateCheckedThisSession = true
         val channel = app.preferenceManager.updateChannel.first()
         val updateResult = runCatching { app.apiClient.checkUpdate(channel, currentVersionCode) }.getOrNull()
         val update = updateResult?.getOrNull()
@@ -214,65 +220,11 @@ fun BootScreen(navController: NavController) {
 
         // 自动更新提示对话框
         if (showUpdateDialog && updateInfo != null) {
-            AlertDialog(
-                onDismissRequest = {
-                    if (!downloading) {
-                        showUpdateDialog = false
-                        navController.navigate("main") { popUpTo("boot") { inclusive = true } }
-                    }
-                },
-                title = { Text("发现新版本", fontSize = 14.sp, fontWeight = FontWeight.Bold) },
-                text = {
-                    Column {
-                        Text(
-                            "新版本：${updateInfo!!.versionName}",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        if (updateInfo!!.changelog.isNotBlank()) {
-                            Spacer(Modifier.height(6.dp))
-                            Text("更新内容：", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text(updateInfo!!.changelog, fontSize = 11.sp)
-                        }
-                        if (downloading) {
-                            Spacer(Modifier.height(8.dp))
-                            Text("下载中 $downloadProgress%", fontSize = 11.sp)
-                            LinearProgressIndicator(
-                                progress = { downloadProgress / 100f },
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
-                        downloadError?.let {
-                            Spacer(Modifier.height(4.dp))
-                            Text(it, fontSize = 10.sp, color = MaterialTheme.colorScheme.error)
-                        }
-                    }
-                },
-                confirmButton = {
-                    if (downloading) {
-                        Button(onClick = {}, enabled = false) { Text("下载中…") }
-                    } else {
-                        Button(onClick = {
-                            scope.launch {
-                                downloading = true
-                                downloadProgress = 0
-                                downloadError = null
-                                app.apiClient.downloadApk(updateInfo!!.apkUrl) { pct -> downloadProgress = pct }.fold(
-                                    onSuccess = { apkFile -> app.apiClient.installApk(apkFile) },
-                                    onFailure = { e -> downloadError = "下载失败：${e.message ?: "未知错误"}" }
-                                )
-                                downloading = false
-                            }
-                        }) { Text("下载安装") }
-                    }
-                },
-                dismissButton = {
-                    if (!downloading) {
-                        OutlinedButton(onClick = {
-                            showUpdateDialog = false
-                            navController.navigate("main") { popUpTo("boot") { inclusive = true } }
-                        }) { Text("跳过") }
-                    }
+            UpdatePromptDialog(
+                update = updateInfo!!,
+                onDismiss = {
+                    showUpdateDialog = false
+                    navController.navigate("main") { popUpTo("boot") { inclusive = true } }
                 }
             )
         }

@@ -32,6 +32,7 @@ import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -41,13 +42,13 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -64,6 +65,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -144,6 +146,30 @@ fun ChatScreen(
     val listState = rememberLazyListState()
     // 待回显的本地乐观消息映射：key = 本地消息 id("local_...") → 超时 Job
     val pendingLocalIds = remember { mutableStateMapOf<String, Job>() }
+
+    // ===== 通话：麦克风权限 + 发起呼叫 =====
+    var pendingCallMedia by remember { mutableStateOf<String?>(null) }
+    val callPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val media = pendingCallMedia
+        pendingCallMedia = null
+        if (granted && media != null && chatType is ChatType.Private) {
+            app.callManager.startCall(chatType.friendId, chatType.friendName, media)
+        } else if (!granted) {
+            Toast.makeText(context, "需要麦克风权限才能通话", Toast.LENGTH_SHORT).show()
+        }
+    }
+    val startCall: (String) -> Unit = { media ->
+        if (chatType is ChatType.Private) {
+            if (!app.callManager.hasAudioPermission()) {
+                pendingCallMedia = media
+                callPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+            } else {
+                app.callManager.startCall(chatType.friendId, chatType.friendName, media)
+            }
+        }
+    }
 
     /** 内容等价判断：语音/图片按前缀（服务端与本地秒数可能有细微差异），文本全等 */
     fun contentEquivalent(contentType: String, localContent: String, serverContent: String): Boolean =
@@ -255,7 +281,8 @@ fun ChatScreen(
         contentType: String,
         content: String,
         image: String? = null,
-        audio: String? = null
+        audio: String? = null,
+        video: String? = null
     ) {
         val now = System.currentTimeMillis()
         // 防抖：2s 内同 contentType + 同 content + 同目标 已经有 local_，不重复插入
@@ -279,6 +306,7 @@ fun ChatScreen(
             content = content,
             image = image,
             audio = audio,
+            video = video,
             timestamp = now
         )
         messages.add(localMsg)
@@ -329,6 +357,13 @@ fun ChatScreen(
     DisposableEffect(chatType) {
         app.activeConversation = conversationTag
         app.notificationHelper.cancel(conversationTag)
+        // 进入会话即清除未读红点
+        app.webSocketClient.clearUnread(
+            when (chatType) {
+                is ChatType.Private -> MessageCache.privateConvId(chatType.friendId)
+                is ChatType.Group -> MessageCache.groupConvId(chatType.groupId)
+            }
+        )
         onDispose {
             if (app.activeConversation == conversationTag) {
                 app.activeConversation = null
@@ -480,6 +515,48 @@ fun ChatScreen(
         }
     }
 
+    val pickVideo = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        if (r.resultCode != Activity.RESULT_OK) return@rememberLauncherForActivityResult
+        val uri = r.data?.data ?: return@rememberLauncherForActivityResult
+        scope.launch {
+            sendingError = null
+            val token = app.preferenceManager.token.first()
+            if (token.isNullOrBlank()) { sendingError = "未登录"; return@launch }
+            val file = withContext(Dispatchers.IO) { uri.toLocalCacheFile(context, "video", ".mp4") }
+            if (file == null) { sendingError = "读取视频失败"; return@launch }
+            // 视频限制 10MB（与服务端一致）
+            if (file.length() > 10L * 1024 * 1024) {
+                file.delete()
+                sendingError = "视频超过 10MB 限制"
+                return@launch
+            }
+            val up = app.apiClient.uploadVideo(token, file)
+            up.onSuccess { uf ->
+                val cu = currentUser?.id ?: savedUserId.value ?: ""
+                val ok = when (chatType) {
+                    is ChatType.Private -> app.webSocketClient.sendPrivateVideo(chatType.friendId, uf.url)
+                    is ChatType.Group -> app.webSocketClient.sendGroupVideo(chatType.groupId, uf.url)
+                }
+                if (ok) {
+                    addOptimisticMsg(
+                        type = when (chatType) {
+                            is ChatType.Private -> "private_message"
+                            is ChatType.Group -> "group_message"
+                        },
+                        fromId = cu,
+                        fromNickname = currentUser?.nickname ?: "",
+                        toId = if (chatType is ChatType.Private) chatType.friendId else null,
+                        groupId = if (chatType is ChatType.Group) chatType.groupId else null,
+                        contentType = "video",
+                        content = "[视频]",
+                        video = uf.url
+                    )
+                } else sendingError = "发送视频失败"
+            }.onFailure { e -> sendingError = "上传视频：${e.message}" }
+            file.delete()
+        }
+    }
+
     val audioPlayer = remember { AudioPlayer(context) }
     DisposableEffect(Unit) {
         onDispose { audioPlayer.release() }
@@ -588,6 +665,12 @@ fun ChatScreen(
                     color = OnSurfaceVariant,
                     fontSize = 10.sp
                 )
+            }
+            if (chatType is ChatType.Private) {
+                Spacer(modifier = Modifier.width(4.dp))
+                HeaderIconButton("📞") { startCall("audio") }
+                Spacer(modifier = Modifier.width(4.dp))
+                HeaderIconButton("🎥") { startCall("video") }
             }
         }
 
@@ -732,6 +815,24 @@ fun ChatScreen(
                 )
             ) { Text("🖼 图片", fontSize = 10.sp) }
 
+            Button(
+                onClick = {
+                    val i = Intent(Intent.ACTION_GET_CONTENT).apply {
+                        type = "video/*"
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                    }
+                    pickVideo.launch(Intent.createChooser(i, "选择视频（最大 10MB）"))
+                },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(32.dp),
+                contentPadding = PaddingValues(0.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = SurfaceVariant,
+                    contentColor = MaterialTheme.colorScheme.onSurface
+                )
+            ) { Text("🎬 视频", fontSize = 10.sp) }
+
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -828,19 +929,33 @@ fun ChatScreen(
                 .padding(bottom = bottomPadding),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            OutlinedTextField(
+            BasicTextField(
                 value = messageInput,
                 onValueChange = { messageInput = it },
-                label = { Text("消息", fontSize = 10.sp) },
                 modifier = Modifier
                     .weight(1f)
-                    .animateContentSize(
-                        animationSpec = spring(
-                            dampingRatio = 0.82f,
-                            stiffness = Spring.StiffnessMediumLow
-                        )
-                    ),
-                singleLine = true
+                    .height(34.dp),
+                singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurface
+                ),
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                decorationBox = { innerTextField ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(RoundedCornerShape(17.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                            .padding(horizontal = 10.dp),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        if (messageInput.isEmpty()) {
+                            Text("消息", fontSize = 10.sp, color = OnSurfaceVariant)
+                        }
+                        innerTextField()
+                    }
+                }
             )
             Spacer(modifier = Modifier.width(4.dp))
             val sendBtnInteraction = remember { MutableInteractionSource() }
@@ -1043,6 +1158,45 @@ private fun MessageBubble(
                             }
                         }
                     }
+                    "video" -> {
+                        val rawUrl = message.video?.takeUnless { it.isNullOrBlank() }
+                            ?: message.content.takeIf { it.startsWith("http") || it.startsWith("/") }
+                        val url = rawUrl?.let { mediaUrlResolver(it) }
+                        val ctx = LocalContext.current
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = if (url != null) {
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable {
+                                        runCatching {
+                                            ctx.startActivity(
+                                                Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            )
+                                        }
+                                    }
+                                    .padding(horizontal = 2.dp, vertical = 3.dp)
+                            } else Modifier
+                        ) {
+                            Text(text = "🎬", fontSize = 16.sp)
+                            Spacer(Modifier.width(6.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    text = if (url != null) "视频 · 点击播放" else "视频 · 加载失败",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Spacer(Modifier.height(2.dp))
+                                Text(
+                                    text = "最大 10MB",
+                                    fontSize = 8.sp,
+                                    color = OnSurfaceVariant
+                                )
+                            }
+                        }
+                    }
                     else -> {
                         Text(
                             text = message.content.ifBlank { "（空消息）" },
@@ -1067,3 +1221,19 @@ private fun MessageBubble(
 private val sdf by lazy { SimpleDateFormat("HH:mm", Locale.getDefault()) }
 private fun formatTime(ts: Long): String =
     if (ts <= 0L) "" else sdf.format(Date(ts))
+
+/** 聊天标题栏上的小圆形图标按钮（通话入口） */
+@Composable
+private fun HeaderIconButton(icon: String, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier.size(34.dp),
+        contentPadding = PaddingValues(0.dp),
+        colors = ButtonDefaults.buttonColors(
+            containerColor = SurfaceVariant,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        )
+    ) {
+        Text(icon, fontSize = 14.sp)
+    }
+}

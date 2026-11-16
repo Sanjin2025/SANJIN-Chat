@@ -50,6 +50,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -79,6 +80,7 @@ import com.sanjinchat.wear.ui.theme.ErrorDeep
 import com.sanjinchat.wear.ui.theme.ErrorLight
 import com.sanjinchat.wear.ui.theme.ExpressiveMotion
 import com.sanjinchat.wear.network.ConnectionState
+import com.sanjinchat.wear.network.ServerEndpoint
 import com.sanjinchat.wear.ui.theme.OnSurfaceVariant
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -103,8 +105,10 @@ fun LoginScreen(navController: NavController) {
     var otpCountdown by remember { mutableStateOf(0) }
     var otpGenLoading by remember { mutableStateOf(false) }
     var otpError by remember { mutableStateOf<String?>(null) }
-    var serverAddress by remember { mutableStateOf("sanjinx.com") }
+    var serverAddress by remember { mutableStateOf("chat.sanjinx.com") }
+    var serverPort by remember { mutableStateOf("8181") }
     var protocol by remember { mutableStateOf("ws") }
+    var showServerSettings by remember { mutableStateOf(false) }
     var rememberLogin by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
@@ -116,14 +120,16 @@ fun LoginScreen(navController: NavController) {
             otpUsername = savedUser
         }
         app.preferenceManager.rememberLogin.first().let { rememberLogin = it }
-        // 读取保存的服务器地址（高级设置里改的），默认 sanjinx.com
+        // 读取保存的服务器地址（高级设置里改的），默认 chat.sanjinx.com:8181
         val savedAddr = app.preferenceManager.serverAddress.first()
         val savedProto = app.preferenceManager.serverProtocol.first()
-        serverAddress = savedAddr.ifBlank { "sanjinx.com" }
+        val address = savedAddr.ifBlank { "chat.sanjinx.com:8181" }
+        serverAddress = ServerEndpoint.extractHost(address)
+        serverPort = ServerEndpoint.extractPort(address)
         protocol = savedProto.ifBlank { "ws" }
-        app.apiClient.serverAddress = serverAddress
+        app.apiClient.serverAddress = "$serverAddress:$serverPort"
         app.apiClient.serverProtocol = protocol
-        app.webSocketClient.serverAddress = serverAddress
+        app.webSocketClient.serverAddress = "$serverAddress:$serverPort"
         app.webSocketClient.serverProtocol = protocol
         // 自动登录（cookie 恢复）失败时的提示，例如"登录已过期，请重新登录"；只显示一次
         app.pendingLoginNotice?.let { notice ->
@@ -237,6 +243,57 @@ fun LoginScreen(navController: NavController) {
             }
             Spacer(modifier = Modifier.height(4.dp))
 
+            // ===== 服务器设置（首次进入可修改地址/端口）=====
+            TextButton(onClick = { showServerSettings = !showServerSettings }) {
+                Text(
+                    text = if (showServerSettings) "收起服务器设置" else "服务器：$serverAddress:$serverPort",
+                    fontSize = 9.sp,
+                    color = OnSurfaceVariant
+                )
+            }
+            if (showServerSettings) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    OutlinedTextField(
+                        value = serverAddress,
+                        onValueChange = { serverAddress = it.trim() },
+                        label = { Text("服务器地址", fontSize = 9.sp) },
+                        singleLine = true,
+                        textStyle = androidx.compose.ui.text.TextStyle(fontSize = 10.sp),
+                        modifier = Modifier.weight(3f)
+                    )
+                    OutlinedTextField(
+                        value = serverPort,
+                        onValueChange = { v -> serverPort = v.filter { it.isDigit() }.take(5) },
+                        label = { Text("端口", fontSize = 9.sp) },
+                        singleLine = true,
+                        textStyle = androidx.compose.ui.text.TextStyle(fontSize = 10.sp),
+                        modifier = Modifier.weight(2f)
+                    )
+                }
+                Spacer(modifier = Modifier.height(3.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    ModeChip(
+                        label = "ws://",
+                        selected = protocol == "ws",
+                        onClick = { protocol = "ws" },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ModeChip(
+                        label = "wss://",
+                        selected = protocol == "wss",
+                        onClick = { protocol = "wss" },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+
             // ===== Expressive 动效：登录模式切换（手机大屏更明显版本） =====
             AnimatedContent(
                 targetState = mode,
@@ -301,7 +358,9 @@ fun LoginScreen(navController: NavController) {
                         LoginMode.QR -> QrForm(
                             onConsumeSuccess = { token, user ->
                                 scope.launch {
-                                    app.preferenceManager.saveServerAddress(serverAddress.trim())
+                                    app.preferenceManager.saveServerAddress(
+                                        "${ServerEndpoint.extractHost(serverAddress.trim())}:${serverPort.trim()}"
+                                    )
                                     app.preferenceManager.saveServerProtocol(protocol)
                                     app.preferenceManager.saveLoginInfo(
                                         token, user.id, user.username, user.nickname
@@ -318,7 +377,7 @@ fun LoginScreen(navController: NavController) {
                                     }
                                     when (state) {
                                         is ConnectionState.Connected ->
-                                            navController.navigate("boot") {
+                                            navController.navigate("main") {
                                                 popUpTo("login") { inclusive = true }
                                             }
                                         is ConnectionState.Error ->
@@ -436,7 +495,7 @@ fun LoginScreen(navController: NavController) {
                     isLoading = true
                     errorMessage = null
                     scope.launch {
-                        val addr = serverAddress.trim()
+                        val addr = "${ServerEndpoint.extractHost(serverAddress.trim())}:${serverPort.trim()}"
                         app.preferenceManager.saveServerAddress(addr)
                         app.preferenceManager.saveServerProtocol(protocol)
                         app.preferenceManager.setRememberLogin(rememberLogin)

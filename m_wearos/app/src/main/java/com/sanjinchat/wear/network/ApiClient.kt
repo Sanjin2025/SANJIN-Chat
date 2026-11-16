@@ -213,8 +213,11 @@ class ApiClient(private val context: Context) {
         build = { b -> b.url("${baseUrl()}/api/pair/status").get() },
         defaultErr = "获取配对码状态失败"
     ) { _, obj ->
-        val code = obj.optString("pairCode")
-        if (code.isNullOrBlank()) null else PairCodeInfo(
+        // 服务端无有效配对码时返回 pairCode: null，
+        // org.json 的 optString 会把它转成字符串 "null"，这里必须显式判断，
+        // 否则会被当成 4 位“有效码”，界面直接显示「生成失败」。
+        val code = if (obj.isNull("pairCode")) "" else obj.optString("pairCode", "")
+        if (code.isNullOrBlank() || code == "null" || code.length != 6) null else PairCodeInfo(
             pairCode = code,
             expiresAt = obj.optLong("expiresAt", 0L),
             expiresIn = obj.optInt("expiresIn", 0),
@@ -403,6 +406,50 @@ class ApiClient(private val context: Context) {
         } catch (e: Exception) {
             Result.failure(e)
         }
+    }
+
+    /** POST /upload/video  fieldname = video/file；服务端限制 10MB */
+    suspend fun uploadVideo(token: String, file: File): Result<UploadedFile> = withContext(Dispatchers.IO) {
+        try {
+            if (file.length() > 10L * 1024 * 1024) {
+                return@withContext Result.failure(Exception("视频超过 10MB 限制"))
+            }
+            val mime = guessVideoMime(file.name)
+            val reqBody = MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart(
+                    name = "video",
+                    filename = file.name,
+                    body = file.asRequestBody(mime.toMediaType())
+                )
+                .build()
+            val request = Request.Builder()
+                .url("${baseUrl()}/upload/video")
+                .header("Authorization", "Bearer $token")
+                .post(reqBody)
+                .build()
+            client().newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: ""
+                val obj = parseJsonOrFallback(response, body, "视频上传失败")
+                if (response.isSuccessful && obj.optBoolean("ok")) {
+                    val url = obj.optString("url").ifBlank { return@use Result.failure(Exception("响应缺少 url")) }
+                    Result.success(UploadedFile(url = url))
+                } else {
+                    Result.failure(Exception(obj.optString("error", "视频上传失败")))
+                }
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    private fun guessVideoMime(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
+        "mp4", "m4v" -> "video/mp4"
+        "webm" -> "video/webm"
+        "3gp" -> "video/3gpp"
+        "mov" -> "video/quicktime"
+        "mkv" -> "video/x-matroska"
+        else -> "video/mp4"
     }
 
     /** POST /upload/audio  fieldname = audio/file，同时支持 duration 字段
@@ -944,6 +991,7 @@ class ApiClient(private val context: Context) {
             content = m.optString("content", ""),
             image = m.optString("image").ifBlank { null },
             audio = m.optString("audio").ifBlank { null },
+            video = m.optString("video").ifBlank { null },
             timestamp = m.optLong("timestamp")
         )
     }

@@ -59,7 +59,64 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ===== 服务端口 =====
-const PORT = 8181;
+// 优先级：命令行 --port 8080 / --port=8080 > 环境变量 SANJIN_PORT > config.json 的 port > 默认 8181
+const PORT = (() => {
+  let raw = null;
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--port' || a === '-p') { raw = argv[i + 1]; break; }
+    if (a.startsWith('--port=')) { raw = a.slice('--port='.length); break; }
+  }
+  if (!raw && process.env.SANJIN_PORT) raw = process.env.SANJIN_PORT;
+  if (!raw) {
+    try {
+      const cfgPath = path.join(__dirname, 'config.json');
+      if (fs.existsSync(cfgPath)) {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+        if (cfg && cfg.port) raw = cfg.port;
+      }
+    } catch (e) {
+      console.warn('[配置] 读取 config.json 失败：', e.message);
+    }
+  }
+  const n = parseInt(raw, 10);
+  return (Number.isFinite(n) && n > 0 && n < 65536) ? n : 8181;
+})();
+
+// ===== 消息保留天数 =====
+// 超过该天数的聊天消息会被定期清理；0 表示不自动清理
+const MESSAGE_RETENTION_DAYS = (() => {
+  let raw = process.env.SANJIN_RETENTION_DAYS ?? null;
+  if (raw == null) {
+    try {
+      const cfgPath = path.join(__dirname, 'config.json');
+      if (fs.existsSync(cfgPath)) {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+        if (cfg && cfg.retentionDays != null) raw = cfg.retentionDays;
+      }
+    } catch (_) { /* ignore */ }
+  }
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+})();
+
+/** 清理超过保留天数的消息 */
+async function cleanupOldMessages() {
+  if (MESSAGE_RETENTION_DAYS <= 0) return;
+  try {
+    const cutoff = Date.now() - MESSAGE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    const messages = storage.read('messages');
+    const kept = messages.filter(m => (m.timestamp || 0) >= cutoff);
+    const removed = messages.length - kept.length;
+    if (removed > 0) {
+      await storage.write('messages', kept);
+      console.log(`[清理] 已删除 ${removed} 条超过 ${MESSAGE_RETENTION_DAYS} 天的消息`);
+    }
+  } catch (e) {
+    console.error('[清理] 清理旧消息失败：', e.message);
+  }
+}
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 // ===== TLS / WSS 配置 =====
@@ -179,6 +236,11 @@ const MIME_MAP = {
   '.wav': 'audio/wav',
   '.webm': 'audio/webm',
   '.m4a': 'audio/mp4',
+  '.mp4': 'video/mp4',
+  '.m4v': 'video/mp4',
+  '.mov': 'video/quicktime',
+  '.3gp': 'video/3gpp',
+  '.mkv': 'video/x-matroska',
   '.apk': 'application/vnd.android.package-archive'
 };
 
@@ -683,6 +745,20 @@ async function handleHttpRequest(req, res) {
       return sendJson(res, 200, { ok: true, url: saved.url, duration });
     }
 
+    if (urlPath === '/upload/video' && req.method === 'POST') {
+      const user = auth.verifyRequest(req);
+      if (!user) return sendJson(res, 401, { error: '未登录' });
+      const { files } = await multipart.parseMultipart(req);
+      const file = files.find(f => f.fieldname === 'video' || f.fieldname === 'file');
+      if (!file) return sendJson(res, 400, { error: '缺少文件' });
+      // 视频限制 10MB
+      const saved = await multipart.saveUploadedFile(
+        file, 'videos', 10 * 1024 * 1024,
+        ['video/*']
+      );
+      return sendJson(res, 200, { ok: true, url: saved.url });
+    }
+
     // ====== 公告接口 ======
     if (urlPath === '/api/announcements' && req.method === 'GET') {
       // 公开，不需要登录
@@ -861,6 +937,15 @@ async function bootstrap() {
       console.log(`[启动] TLS 模式已启用 (证书: ${TLS_CONFIG.cert})`);
     } else {
       console.log('[启动] TLS 未启用 (明文 ws:// 模式)');
+    }
+
+    // 消息保留策略：启动时清理一次，之后每 6 小时清理一次
+    if (MESSAGE_RETENTION_DAYS > 0) {
+      console.log(`[启动] 消息保留 ${MESSAGE_RETENTION_DAYS} 天，超期自动清理`);
+      cleanupOldMessages();
+      setInterval(cleanupOldMessages, 6 * 60 * 60 * 1000);
+    } else {
+      console.log('[启动] 消息保留策略：不自动清理');
     }
   });
 }

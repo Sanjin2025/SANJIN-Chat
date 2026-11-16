@@ -15,6 +15,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 按住说话：录音权限 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- 音视频通话：切换通话音频模式 / 免提 -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <!-- 扫码登录：相机权限 -->
     <uses-permission android:name="android.permission.CAMERA" />

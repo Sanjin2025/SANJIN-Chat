@@ -101,6 +101,7 @@ import com.sanjinchat.wear.network.ChatEvent
 import com.sanjinchat.wear.network.ConnectionState
 import com.sanjinchat.wear.network.Diagnostics
 import com.sanjinchat.wear.network.ProbeResult
+import com.sanjinchat.wear.network.ServerEndpoint
 import com.sanjinchat.wear.ui.theme.ErrorDeep
 import com.sanjinchat.wear.ui.theme.ErrorLight
 import com.sanjinchat.wear.ui.theme.ExpressiveMotion
@@ -151,6 +152,65 @@ private enum class DialogKind {
     UpdateCheck,
 }
 
+/** 聊天列表条目（私聊/群聊统一模型） */
+private data class ChatEntry(
+    val convId: String,
+    val route: String,
+    val name: String,
+    val subtitle: String,
+    val isGroup: Boolean,
+    val isOnline: Boolean,
+    val avatarEmoji: String?,
+    val avatarUrl: String?,
+    val lastTs: Long,
+    val unread: Int
+)
+
+/** 合并私聊与群聊：有未读的排最前，其次按最后消息时间倒序 */
+private fun buildChatEntries(
+    friends: List<Friend>,
+    groups: List<GroupMembership>,
+    lastMessages: Map<String, ChatMessage>,
+    unreadCounts: Map<String, Int>
+): List<ChatEntry> {
+    val entries = friends.map { friend ->
+        val convId = MessageCache.privateConvId(friend.userId)
+        val lastMsg = lastMessages[convId]
+        val displayName = friend.user.nickname.ifBlank { friend.user.username }
+        ChatEntry(
+            convId = convId,
+            route = "chat/private/${friend.userId}/$displayName",
+            name = displayName,
+            subtitle = lastMsg?.let { formatMsgPreview(it) } ?: if (friend.online) "在线" else "离线",
+            isGroup = false,
+            isOnline = friend.online,
+            avatarEmoji = friend.user.avatarEmoji,
+            avatarUrl = friend.user.avatar,
+            lastTs = lastMsg?.timestamp ?: 0L,
+            unread = unreadCounts[convId] ?: 0
+        )
+    } + groups.map { group ->
+        val convId = MessageCache.groupConvId(group.group.id)
+        val lastMsg = lastMessages[convId]
+        ChatEntry(
+            convId = convId,
+            route = "chat/group/${group.group.id}/${group.group.name}",
+            name = group.group.name,
+            subtitle = lastMsg?.let { formatMsgPreview(it) }
+                ?: "${group.memberCount}人 · #${group.group.groupNumber}",
+            isGroup = true,
+            isOnline = false,
+            avatarEmoji = null,
+            avatarUrl = null,
+            lastTs = lastMsg?.timestamp ?: 0L,
+            unread = unreadCounts[convId] ?: 0
+        )
+    }
+    return entries.sortedWith(
+        compareByDescending<ChatEntry> { it.unread > 0 }.thenByDescending { it.lastTs }
+    )
+}
+
 @Composable
 fun MainScreen(navController: NavController) {
     val app = SanjinChatApp.instance
@@ -161,9 +221,26 @@ fun MainScreen(navController: NavController) {
     val friends by app.webSocketClient.friends.collectAsState()
     val groups by app.webSocketClient.groups.collectAsState()
     val friendRequests by app.webSocketClient.friendRequests.collectAsState()
+    val unreadCounts by app.webSocketClient.unread.collectAsState()
+    val pendingChatTarget by app.pendingChatTarget.collectAsState()
+
+    // 点击通知后跳转到对应会话
+    LaunchedEffect(pendingChatTarget, currentUser) {
+        val target = pendingChatTarget ?: return@LaunchedEffect
+        if (currentUser == null) return@LaunchedEffect
+        app.consumeChatTarget()
+        if (target.isGroup) {
+            navController.navigate("chat/group/${target.id}/${target.name}")
+        } else {
+            navController.navigate("chat/private/${target.id}/${target.name}")
+        }
+    }
 
     var currentTab by remember { mutableStateOf(MainTab.CHATS) }
     val listState = rememberLazyListState()
+
+    // 登录后自动检查更新的结果（非空则弹出更新提示）
+    var autoUpdate by remember { mutableStateOf<ApiClient.AppUpdate?>(null) }
 
     val screenShape by app.preferenceManager.screenShape.collectAsState(initial = "auto")
     val isRound = when (screenShape) {
@@ -182,8 +259,9 @@ fun MainScreen(navController: NavController) {
 
     LaunchedEffect(Unit) {
         val token = app.preferenceManager.token.first()
-        val serverAddr = "sanjin666.dpdns.org:8181"
-        val protocol = "ws"
+        // 使用用户配置的服务器地址/协议，禁止硬编码覆盖（否则会连到错误服务器导致好友/群为空）
+        val serverAddr = app.preferenceManager.serverAddress.first()
+        val protocol = app.preferenceManager.serverProtocol.first()
         app.apiClient.serverAddress = serverAddr
         app.webSocketClient.serverAddress = serverAddr
         app.apiClient.serverProtocol = protocol
@@ -206,6 +284,22 @@ fun MainScreen(navController: NavController) {
             if (connectionState !is ConnectionState.Connected) {
                 runCatching { app.webSocketClient.connect(token) }
             }
+
+            // 登录后自动检查更新（本次进程只检查一次，避免与 BootScreen 重复弹窗）
+            if (!app.updateCheckedThisSession) {
+                app.updateCheckedThisSession = true
+                val currentVersionCode = runCatching {
+                    val pkg = app.packageManager.getPackageInfo(app.packageName, 0)
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P)
+                        pkg.longVersionCode.toInt() else @Suppress("DEPRECATION") pkg.versionCode
+                }.getOrDefault(0)
+                val channel = app.preferenceManager.updateChannel.first()
+                val update = runCatching { app.apiClient.checkUpdate(channel, currentVersionCode) }
+                    .getOrNull()?.getOrNull()
+                if (update != null && update.hasUpdate) {
+                    autoUpdate = update
+                }
+            }
         }
     }
 
@@ -217,7 +311,30 @@ fun MainScreen(navController: NavController) {
         }
     }
 
+    // 收到新消息时刷新会话预览，保证排序按最新消息进行
+    LaunchedEffect(friends, groups) {
+        app.webSocketClient.events.collect { event ->
+            if (event is ChatEvent.PrivateMessage || event is ChatEvent.GroupMessage) {
+                val convIds = friends.map { MessageCache.privateConvId(it.userId) } +
+                        groups.map { MessageCache.groupConvId(it.group.id) }
+                if (convIds.isNotEmpty()) {
+                    lastMessages = app.messageCache.getLastMessages(convIds)
+                }
+            }
+        }
+    }
+
+    // 聊天列表（未读优先 + 最后消息时间倒序）
+    val chatEntries = remember(friends, groups, lastMessages, unreadCounts) {
+        buildChatEntries(friends, groups, lastMessages, unreadCounts)
+    }
+
     var dialogKind by remember { mutableStateOf(DialogKind.None) }
+
+    // 自动检查到更新时，直接打开检查更新面板展示新版本
+    LaunchedEffect(autoUpdate) {
+        if (autoUpdate != null) dialogKind = DialogKind.UpdateCheck
+    }
     var addTarget by remember { mutableStateOf("") }
     var addMessage by remember { mutableStateOf("") }
     var friendsSearchQuery by remember { mutableStateOf("") }
@@ -234,6 +351,7 @@ fun MainScreen(navController: NavController) {
     var diagResults by remember { mutableStateOf<List<ProbeResult>?>(null) }
     var diagRunning by remember { mutableStateOf(false) }
     var advAddress by remember { mutableStateOf("") }
+    var advPort by remember { mutableStateOf("8181") }
     var advProtocol by remember { mutableStateOf("ws") }
     var advError by remember { mutableStateOf<String?>(null) }
     var searchKind by remember { mutableStateOf("user") }
@@ -441,23 +559,37 @@ fun MainScreen(navController: NavController) {
                     DialogKind.AdvancedSettings -> AdvancedSettingsPanel(
                         address = advAddress,
                         onAddressChange = { advAddress = it },
+                        port = advPort,
+                        onPortChange = { advPort = it },
                         protocol = advProtocol,
                         onProtocolChange = { advProtocol = it },
                         error = advError,
                         onCancel = { dialogKind = DialogKind.None },
                         onSave = {
                             scope.launch {
-                                val addr = advAddress.trim().removeSuffix("/")
-                                if (addr.isBlank()) {
+                                val host = ServerEndpoint.extractHost(advAddress.trim())
+                                val portNum = advPort.trim().toIntOrNull()
+                                if (host.isBlank()) {
                                     advError = "地址不能为空"
                                     return@launch
                                 }
+                                if (portNum == null || portNum !in 1..65535) {
+                                    advError = "端口需为 1-65535"
+                                    return@launch
+                                }
+                                val addr = "$host:$portNum"
                                 app.preferenceManager.saveServerAddress(addr)
                                 app.preferenceManager.saveServerProtocol(advProtocol)
                                 app.apiClient.serverAddress = addr
                                 app.webSocketClient.serverAddress = addr
                                 app.apiClient.serverProtocol = advProtocol
                                 app.webSocketClient.serverProtocol = advProtocol
+                                // 立即按新地址重连，否则要等下次自动重连才生效
+                                val token = app.preferenceManager.token.first()
+                                if (!token.isNullOrBlank()) {
+                                    app.webSocketClient.disconnect()
+                                    app.webSocketClient.connect(token)
+                                }
                                 advError = null
                                 dialogKind = DialogKind.None
                             }
@@ -601,7 +733,8 @@ fun MainScreen(navController: NavController) {
                         onClose = { dialogKind = DialogKind.None }
                     )
                     DialogKind.UpdateCheck -> UpdateCheckPanel(
-                        onClose = { dialogKind = DialogKind.None }
+                        onClose = { dialogKind = DialogKind.None },
+                        initialUpdate = autoUpdate
                     )
                     DialogKind.None -> {}
                 }
@@ -754,33 +887,17 @@ fun MainScreen(navController: NavController) {
                                     EmptyState(text = "暂无聊天\n添加好友或加入群聊以开始")
                                 }
                             } else {
-                                items(friends) { friend ->
-                                    val convId = MessageCache.privateConvId(friend.userId)
-                                    val lastMsg = lastMessages[convId]
+                                // 私聊 + 群聊合并：有未读的排最前，其次按最后消息时间倒序
+                                items(chatEntries, key = { it.convId }) { item ->
                                     ChatListItem(
-                                        name = friend.user.nickname.ifBlank { friend.user.username },
-                                        subtitle = lastMsg?.let { formatMsgPreview(it) }
-                                            ?: if (friend.online) "在线" else "离线",
-                                        isOnline = friend.online,
-                                        avatarEmoji = friend.user.avatarEmoji,
-                                        avatarUrl = friend.user.avatar,
-                                        onClick = {
-                                            val displayName = friend.user.nickname.ifBlank { friend.user.username }
-                                            navController.navigate("chat/private/${friend.userId}/${displayName}")
-                                        }
-                                    )
-                                }
-                                items(groups) { group ->
-                                    val convId = MessageCache.groupConvId(group.group.id)
-                                    val lastMsg = lastMessages[convId]
-                                    ChatListItem(
-                                        name = group.group.name,
-                                        subtitle = lastMsg?.let { formatMsgPreview(it) }
-                                            ?: "${group.memberCount}人 · #${group.group.groupNumber}",
-                                        isGroup = true,
-                                        onClick = {
-                                            navController.navigate("chat/group/${group.group.id}/${group.group.name}")
-                                        }
+                                        name = item.name,
+                                        subtitle = item.subtitle,
+                                        isOnline = item.isOnline,
+                                        isGroup = item.isGroup,
+                                        avatarEmoji = item.avatarEmoji,
+                                        avatarUrl = item.avatarUrl,
+                                        unreadCount = item.unread,
+                                        onClick = { navController.navigate(item.route) }
                                     )
                                 }
                             }
@@ -1118,8 +1235,10 @@ fun MainScreen(navController: NavController) {
                                 AssistChip(
                                     onClick = {
                                         scope.launch {
-                                            advAddress = app.preferenceManager.serverAddress.first()
-                                                .takeUnless { it.isBlank() } ?: "sanjin666.dpdns.org:8181"
+                                            val saved = app.preferenceManager.serverAddress.first()
+                                                .takeUnless { it.isBlank() } ?: "chat.sanjinx.com:8181"
+                                            advAddress = ServerEndpoint.extractHost(saved)
+                                            advPort = ServerEndpoint.extractPort(saved)
                                             advProtocol = app.preferenceManager.serverProtocol.first()
                                                 .takeUnless { it.isBlank() } ?: "ws"
                                             advError = null
@@ -1140,7 +1259,7 @@ fun MainScreen(navController: NavController) {
                                         diagRunning = true
                                         diagResults = null
                                         scope.launch {
-                                            val addr = app.apiClient.serverAddress.ifBlank { "sanjin666.dpdns.org:8181" }
+                                            val addr = app.apiClient.serverAddress.ifBlank { "chat.sanjinx.com" }
                                             val proto = app.apiClient.serverProtocol
                                             val results = Diagnostics.runAll(addr, proto)
                                             diagResults = results
@@ -1853,6 +1972,8 @@ private fun PairCodeGroup(digits: String, expired: Boolean) {
 private fun AdvancedSettingsPanel(
     address: String,
     onAddressChange: (String) -> Unit,
+    port: String,
+    onPortChange: (String) -> Unit,
     protocol: String,
     onProtocolChange: (String) -> Unit,
     error: String?,
@@ -1867,17 +1988,30 @@ private fun AdvancedSettingsPanel(
     ) {
         PageHeader(title = "高级设置", onBack = onCancel)
         Spacer(Modifier.height(4.dp))
-        OutlinedTextField(
-            value = address,
-            onValueChange = onAddressChange,
-            label = { Text("服务器 host:port", fontSize = 10.sp) },
-            singleLine = true,
-            textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp),
-            modifier = Modifier.fillMaxWidth()
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            OutlinedTextField(
+                value = address,
+                onValueChange = onAddressChange,
+                label = { Text("服务器地址", fontSize = 10.sp) },
+                singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp),
+                modifier = Modifier.weight(3f)
+            )
+            OutlinedTextField(
+                value = port,
+                onValueChange = { v -> onPortChange(v.filter { it.isDigit() }.take(5)) },
+                label = { Text("端口", fontSize = 10.sp) },
+                singleLine = true,
+                textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp),
+                modifier = Modifier.weight(2f)
+            )
+        }
         Spacer(Modifier.height(3.dp))
         Text(
-            text = "默认：sanjin666.dpdns.org:8181",
+            text = "默认：chat.sanjinx.com:8181",
             color = OnSurfaceVariant,
             fontSize = 9.sp
         )
@@ -2314,6 +2448,7 @@ private fun ChatListItem(
     isGroup: Boolean = false,
     avatarEmoji: String? = null,
     avatarUrl: String? = null,
+    unreadCount: Int = 0,
     onClick: () -> Unit
 ) {
     val interaction = remember { MutableInteractionSource() }
@@ -2363,6 +2498,24 @@ private fun ChatListItem(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+            }
+            if (unreadCount > 0) {
+                // 未读红点（未读数 > 99 时显示 99+）
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(ErrorLight)
+                        .padding(horizontal = 4.dp, vertical = 1.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (unreadCount > 99) "99+" else unreadCount.toString(),
+                        color = androidx.compose.ui.graphics.Color.White,
+                        fontSize = 8.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Spacer(modifier = Modifier.width(4.dp))
             }
             if (!isGroup) {
                 Box(
@@ -2817,7 +2970,10 @@ private fun InfoRow(label: String, value: String) {
 // ==================== 检查更新面板 ====================
 
 @Composable
-private fun UpdateCheckPanel(onClose: () -> Unit) {
+private fun UpdateCheckPanel(
+    onClose: () -> Unit,
+    initialUpdate: ApiClient.AppUpdate? = null
+) {
     val app = SanjinChatApp.instance
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -2839,7 +2995,7 @@ private fun UpdateCheckPanel(onClose: () -> Unit) {
     var channel by remember { mutableStateOf("stable") }
     var customUrl by remember { mutableStateOf("") }
     var checking by remember { mutableStateOf(false) }
-    var checkResult by remember { mutableStateOf<ApiClient.AppUpdate?>(null) }
+    var checkResult by remember { mutableStateOf(initialUpdate) }
     var checkMsg by remember { mutableStateOf<String?>(null) }
     var downloading by remember { mutableStateOf(false) }
     var downloadProgress by remember { mutableStateOf(0) }

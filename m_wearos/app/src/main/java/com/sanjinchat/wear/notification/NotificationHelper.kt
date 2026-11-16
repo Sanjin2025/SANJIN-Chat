@@ -44,21 +44,25 @@ class NotificationHelper(private val context: Context) {
     /**
      * 发送消息通知。
      * @param msg 收到的消息
-     * @param senderName 用于显示的发送方名称（好友昵称 / 群名+发送者）
+     * @param senderName 通知标题（群消息为群名，私聊为发送者昵称）
      * @param conversationTag 用于聚合同会话通知（friendId 或 groupId）
+     * @param bodySenderName 非空时正文格式为「该名称：内容」（群消息传发送者昵称）
      */
     fun showMessageNotification(
         msg: ChatMessage,
         senderName: String,
-        conversationTag: String
+        conversationTag: String,
+        bodySenderName: String? = null,
+        extraName: String? = null
     ) {
         val mgr = context.getSystemService(NotificationManager::class.java) ?: return
 
-        val contentText = when (msg.contentType) {
+        val rawText = when (msg.contentType) {
             "image" -> "[图片]"
             "audio" -> "[语音]"
             else -> msg.content.ifBlank { "[消息]" }
         }
+        val contentText = if (bodySenderName.isNullOrBlank()) rawText else "$bodySenderName：$rawText"
 
         val tapIntent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -66,6 +70,7 @@ class NotificationHelper(private val context: Context) {
             putExtra(EXTRA_CONVERSATION_TAG, conversationTag)
             putExtra(EXTRA_IS_GROUP, msg.type == "group_message")
             putExtra(EXTRA_TARGET_ID, msg.groupId ?: msg.fromId)
+            putExtra(EXTRA_CONVERSATION_NAME, extraName ?: senderName)
         }
 
         val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -114,5 +119,6 @@ class NotificationHelper(private val context: Context) {
         const val EXTRA_CONVERSATION_TAG = "extra_conversation_tag"
         const val EXTRA_IS_GROUP = "extra_is_group"
         const val EXTRA_TARGET_ID = "extra_target_id"
+        const val EXTRA_CONVERSATION_NAME = "extra_conversation_name"
     }
 }
