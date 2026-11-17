@@ -51,6 +51,15 @@ sealed class ChatEvent {
     data class PresenceUpdate(val statuses: Map<String, String>) : ChatEvent()
     data class Error(val message: String) : ChatEvent()
 
+    // ===== 登录设备管理 =====
+    data class DeviceLogin(
+        val deviceName: String,
+        val deviceId: String?,
+        val ip: String?,
+        val connectedAt: Long
+    ) : ChatEvent()
+    data class DeviceLogout(val reason: String) : ChatEvent()
+
     // ===== 音视频通话信令 =====
     data class CallInvite(val fromId: String, val fromNickname: String, val media: String) : ChatEvent()
     data class CallRinging(val toId: String) : ChatEvent()
@@ -260,7 +269,17 @@ class ChatWebSocketClient {
         val scheme = if (serverProtocol == "wss") "wss" else "ws"
         val base = "$scheme://$withPort"
         val baseClean = if (base.endsWith("/")) base.dropLast(1) else base
-        return "$baseClean/ws?token=$token"
+        val params = mutableListOf("token=$token")
+        deviceId?.let { params += "deviceId=${java.net.URLEncoder.encode(it, "UTF-8")}" }
+        deviceName?.let { params += "deviceName=${java.net.URLEncoder.encode(it, "UTF-8")}" }
+        return "$baseClean/ws?${params.joinToString("&")}"
+    }
+
+    companion object {
+        /** 每台设备首次启动生成一次的唯一 id（存 DataStore），用于服务端识别多设备 */
+        @Volatile var deviceId: String? = null
+        /** 上报给服务端的设备名，默认 Build.MODEL */
+        @Volatile var deviceName: String? = null
     }
 
     /**
@@ -408,6 +427,30 @@ class ChatWebSocketClient {
                                 ChatEvent.CallEnd(
                                     fromId = json.optString("fromId"),
                                     reason = json.optString("reason", "hangup")
+                                )
+                            )
+                        }
+                    }
+                    "device:login" -> {
+                        runCatching {
+                            val d = json.optJSONObject("device")
+                            if (d != null) {
+                                _events.emit(
+                                    ChatEvent.DeviceLogin(
+                                        deviceName = d.optString("deviceName", "未知设备"),
+                                        deviceId = if (d.isNull("deviceId")) null else d.optString("deviceId"),
+                                        ip = if (d.isNull("ip")) null else d.optString("ip"),
+                                        connectedAt = d.optLong("connectedAt", 0L)
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    "device:logout" -> {
+                        runCatching {
+                            _events.emit(
+                                ChatEvent.DeviceLogout(
+                                    reason = json.optString("reason", "该设备已被取消登录")
                                 )
                             )
                         }
@@ -795,6 +838,9 @@ class ChatWebSocketClient {
             content = json.optString("content", ""),
             image = json.optString("image").ifBlank { null },
             audio = json.optString("audio").ifBlank { null },
+            video = json.optString("video").ifBlank { null },
+            callMedia = json.optString("callMedia").ifBlank { null },
+            callSeconds = json.optInt("callSeconds", 0),
             timestamp = json.optLong("timestamp")
         )
     }

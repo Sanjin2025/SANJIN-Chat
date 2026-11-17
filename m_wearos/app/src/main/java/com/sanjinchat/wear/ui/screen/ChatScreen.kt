@@ -18,6 +18,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -83,6 +84,7 @@ import com.sanjinchat.wear.SanjinChatApp
 import com.sanjinchat.wear.audio.AudioPlayer
 import com.sanjinchat.wear.audio.AudioRecorder
 import com.sanjinchat.wear.data.MessageCache
+import com.sanjinchat.wear.media.MediaSaver
 import com.sanjinchat.wear.model.ChatMessage
 import com.sanjinchat.wear.network.ChatEvent
 import com.sanjinchat.wear.network.ConnectionState
@@ -147,26 +149,35 @@ fun ChatScreen(
     // 待回显的本地乐观消息映射：key = 本地消息 id("local_...") → 超时 Job
     val pendingLocalIds = remember { mutableStateMapOf<String, Job>() }
 
-    // ===== 通话：麦克风权限 + 发起呼叫 =====
+    // ===== 通话：麦克风/相机权限 + 发起呼叫 =====
     var pendingCallMedia by remember { mutableStateOf<String?>(null) }
     val callPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
         val media = pendingCallMedia
         pendingCallMedia = null
-        if (granted && media != null && chatType is ChatType.Private) {
-            app.callManager.startCall(chatType.friendId, chatType.friendName, media)
-        } else if (!granted) {
-            Toast.makeText(context, "需要麦克风权限才能通话", Toast.LENGTH_SHORT).show()
+        if (media == null || chatType !is ChatType.Private) return@rememberLauncherForActivityResult
+        val audioOk = grants[android.Manifest.permission.RECORD_AUDIO]
+            ?: app.callManager.hasAudioPermission()
+        val cameraOk = grants[android.Manifest.permission.CAMERA]
+            ?: app.callManager.hasCameraPermission()
+        when {
+            !audioOk -> Toast.makeText(context, "需要麦克风权限才能通话", Toast.LENGTH_SHORT).show()
+            media == "video" && !cameraOk ->
+                Toast.makeText(context, "需要相机权限才能视频通话", Toast.LENGTH_SHORT).show()
+            else -> app.callManager.startCall(chatType.friendId, chatType.friendName, media)
         }
     }
     val startCall: (String) -> Unit = { media ->
         if (chatType is ChatType.Private) {
-            if (!app.callManager.hasAudioPermission()) {
-                pendingCallMedia = media
-                callPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
-            } else {
+            val need = ArrayList<String>()
+            if (!app.callManager.hasAudioPermission()) need += android.Manifest.permission.RECORD_AUDIO
+            if (media == "video" && !app.callManager.hasCameraPermission()) need += android.Manifest.permission.CAMERA
+            if (need.isEmpty()) {
                 app.callManager.startCall(chatType.friendId, chatType.friendName, media)
+            } else {
+                pendingCallMedia = media
+                callPermissionLauncher.launch(need.toTypedArray())
             }
         }
     }
@@ -480,6 +491,63 @@ fun ChatScreen(
         }
     }
 
+    // 断网重连后云端同步完成：把服务器补回的消息并入当前会话（按 id 去重）
+    LaunchedEffect(chatType) {
+        app.messageSyncSignal.collect {
+            val convId = when (chatType) {
+                is ChatType.Private -> MessageCache.privateConvId(chatType.friendId)
+                is ChatType.Group -> MessageCache.groupConvId(chatType.groupId)
+            }
+            val cached = app.messageCache.getMessages(convId)
+                .filter { !it.id.startsWith("local_") }
+            val existingIds = messages.map { it.id }.toMutableSet()
+            var added = false
+            for (m in cached) {
+                if (m.id !in existingIds) {
+                    messages.add(m)
+                    existingIds.add(m.id)
+                    added = true
+                }
+            }
+            if (added) {
+                messages.sortBy { it.timestamp }
+                collapseEchoDuplicates()
+                runCatching { listState.animateScrollToItem(messages.size - 1) }
+            }
+        }
+    }
+
+    // 通话结束：在当前私聊里插入一条通话记录（可点击再次拨打）
+    LaunchedEffect(chatType) {
+        app.callManager.callLogs.collect { log ->
+            if (chatType is ChatType.Private && log.peerId == chatType.friendId) {
+                val meId = currentUser?.id ?: savedUserId.value ?: ""
+                val callMsg = ChatMessage(
+                    id = "call_${log.timestamp}",
+                    type = "private_message",
+                    fromId = meId,
+                    fromNickname = "",
+                    toId = log.peerId,
+                    contentType = "call",
+                    content = log.label,
+                    callMedia = log.media,
+                    callSeconds = log.durationSec,
+                    timestamp = log.timestamp
+                )
+                if (messages.none { it.id == callMsg.id }) {
+                    messages.add(callMsg)
+                    messages.sortBy { it.timestamp }
+                    runCatching {
+                        app.messageCache.saveMessage(
+                            MessageCache.privateConvId(log.peerId), callMsg
+                        )
+                    }
+                    runCatching { listState.animateScrollToItem(messages.size - 1) }
+                }
+            }
+        }
+    }
+
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         if (r.resultCode != Activity.RESULT_OK) return@rememberLauncherForActivityResult
         val uri = r.data?.data ?: return@rememberLauncherForActivityResult
@@ -674,7 +742,11 @@ fun ChatScreen(
             }
         }
 
-        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+        ) {
             if (messages.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text(
@@ -709,6 +781,17 @@ fun ChatScreen(
                             showSender = (chatType is ChatType.Group) && !isSelf,
                             mediaUrlResolver = { app.apiClient.mediaUrl(it) },
                             audioPlayer = audioPlayer,
+                            onCallClick = startCall,
+                            onSaveMedia = { url, isVideo ->
+                                scope.launch {
+                                    val ext = if (isVideo) "mp4" else "jpg"
+                                    val name = "sanjin_${System.currentTimeMillis()}.$ext"
+                                    MediaSaver.save(
+                                        context,
+                                        MediaSaver.SaveRequest(url = url, isVideo = isVideo, displayName = name)
+                                    )
+                                }
+                            },
                             modifier = Modifier.animateItem(
                                 placementSpec = spring(
                                     dampingRatio = 0.85f,
@@ -785,13 +868,6 @@ fun ChatScreen(
                 .padding(horizontal = hPadding, vertical = 1.dp),
             horizontalArrangement = Arrangement.spacedBy(3.dp)
         ) {
-            val imgBtnInteraction = remember { MutableInteractionSource() }
-            val imgBtnPressed by imgBtnInteraction.collectIsPressedAsState()
-            val imgBtnScale by animateFloatAsState(
-                targetValue = if (imgBtnPressed) 0.92f else 1f,
-                animationSpec = spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessHigh),
-                label = "imgBtnScale"
-            )
             Button(
                 onClick = {
                     val i = Intent(Intent.ACTION_GET_CONTENT).apply {
@@ -800,14 +876,9 @@ fun ChatScreen(
                     }
                     pickImage.launch(Intent.createChooser(i, "选择图片"))
                 },
-                interactionSource = imgBtnInteraction,
                 modifier = Modifier
                     .weight(1f)
-                    .height(32.dp)
-                    .graphicsLayer {
-                        scaleX = imgBtnScale
-                        scaleY = imgBtnScale
-                    },
+                    .height(32.dp),
                 contentPadding = PaddingValues(0.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = SurfaceVariant,
@@ -1030,6 +1101,8 @@ private fun MessageBubble(
     showSender: Boolean,
     mediaUrlResolver: (String) -> String?,
     audioPlayer: AudioPlayer,
+    onCallClick: (String) -> Unit = {},
+    onSaveMedia: (url: String, isVideo: Boolean) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -1062,6 +1135,33 @@ private fun MessageBubble(
         ) {
             Column(modifier = Modifier.padding(8.dp)) {
                 when (message.contentType) {
+                    "call" -> {
+                        // 通话记录：显示时长/取消原因，点击可再次拨打
+                        val isVideoCall = message.callMedia == "video"
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { onCallClick(if (isVideoCall) "video" else "audio") }
+                                .padding(horizontal = 2.dp, vertical = 2.dp)
+                        ) {
+                            Text(if (isVideoCall) "🎥" else "📞", fontSize = 16.sp)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Column {
+                                Text(
+                                    text = message.content,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    text = "点击${if (isVideoCall) "视频" else "语音"}通话",
+                                    fontSize = 8.sp,
+                                    color = OnSurfaceVariant
+                                )
+                            }
+                        }
+                    }
                     "image" -> {
                         val rawUrl = message.image?.takeUnless { it.isNullOrBlank() }
                             ?: message.content?.takeIf { it.startsWith("http") || it.startsWith("/") }
@@ -1077,7 +1177,18 @@ private fun MessageBubble(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .height(140.dp)
-                                    .clip(RoundedCornerShape(8.dp)),
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .combinedClickable(
+                                        onClick = {
+                                            runCatching {
+                                                ctx.startActivity(
+                                                    Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                )
+                                            }
+                                        },
+                                        onLongClick = { onSaveMedia(url, false) }
+                                    ),
                                 contentScale = ContentScale.Crop
                             )
                         } else {
@@ -1169,14 +1280,17 @@ private fun MessageBubble(
                                 Modifier
                                     .fillMaxWidth()
                                     .clip(RoundedCornerShape(10.dp))
-                                    .clickable {
-                                        runCatching {
-                                            ctx.startActivity(
-                                                Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
-                                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                            )
-                                        }
-                                    }
+                                    .combinedClickable(
+                                        onClick = {
+                                            runCatching {
+                                                ctx.startActivity(
+                                                    Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                )
+                                            }
+                                        },
+                                        onLongClick = { onSaveMedia(url, true) }
+                                    )
                                     .padding(horizontal = 2.dp, vertical = 3.dp)
                             } else Modifier
                         ) {

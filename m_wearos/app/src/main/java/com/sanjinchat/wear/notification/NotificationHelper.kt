@@ -38,7 +38,84 @@ class NotificationHelper(private val context: Context) {
                 }
                 mgr.createNotificationChannel(channel)
             }
+            if (mgr.getNotificationChannel(CHANNEL_CALLS) == null) {
+                val callChannel = NotificationChannel(
+                    CHANNEL_CALLS,
+                    "通话来电",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "语音/视频通话来电提醒"
+                    enableVibration(true)
+                    enableLights(true)
+                    setSound(
+                        android.provider.Settings.System.DEFAULT_RINGTONE_URI,
+                        android.media.AudioAttributes.Builder()
+                            .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+                    )
+                    lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+                }
+                mgr.createNotificationChannel(callChannel)
+            }
+            if (mgr.getNotificationChannel(CHANNEL_DEVICES) == null) {
+                val dc = NotificationChannel(
+                    CHANNEL_DEVICES,
+                    "登录安全提醒",
+                    NotificationManager.IMPORTANCE_HIGH
+                ).apply {
+                    description = "账号在新设备上登录 / 被取消登录的提醒"
+                    enableVibration(true); enableLights(true)
+                    lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+                }
+                mgr.createNotificationChannel(dc)
+            }
         }
+    }
+
+    /**
+     * 来电通知：无论应用在前台还是后台，都在系统通知栏显示。
+     * 「接听」会拉起 MainActivity 并自动接听，「拒绝」直接拒绝。
+     */
+    fun showIncomingCallNotification(peerId: String, peerName: String, media: String) {
+        val mgr = context.getSystemService(NotificationManager::class.java) ?: return
+        val isVideo = media == "video"
+        val title = if (isVideo) "视频通话邀请" else "语音通话邀请"
+        val text = "$peerName 正在呼叫你"
+
+        val openIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(EXTRA_ACCEPT_CALL, true)
+        }
+        val openPi = PendingIntent.getActivity(
+            context, CALL_NOTIFICATION_ID, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val declinePi = PendingIntent.getBroadcast(
+            context, CALL_NOTIFICATION_ID + 1,
+            Intent(context, CallActionReceiver::class.java).setAction(ACTION_DECLINE_CALL),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(context, CHANNEL_CALLS)
+            .setSmallIcon(R.drawable.ic_message)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setOngoing(true)
+            .setAutoCancel(false)
+            .setContentIntent(openPi)
+            .setFullScreenIntent(openPi, true)
+            .addAction(0, "拒绝", declinePi)
+            .addAction(0, "接听", openPi)
+
+        mgr.notify(CALL_NOTIFICATION_ID, builder.build())
+    }
+
+    fun cancelIncomingCallNotification() {
+        val mgr = context.getSystemService(NotificationManager::class.java) ?: return
+        runCatching { mgr.cancel(CALL_NOTIFICATION_ID) }
     }
 
     /**
@@ -105,6 +182,46 @@ class NotificationHelper(private val context: Context) {
         mgr.notify(conversationTag.hashCode(), builder.build())
     }
 
+    /** 新设备登录提醒：推给同账号的其他在线设备 */
+    fun showDeviceLoginNotification(deviceName: String, ip: String?) {
+        val builder = NotificationCompat.Builder(context, CHANNEL_DEVICES)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle("你的账号在新设备上登录")
+            .setContentText(buildString {
+                append(deviceName)
+                if (!ip.isNullOrBlank()) append("（$ip）")
+            })
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    buildString {
+                        append("设备：").append(deviceName).append('\n')
+                        if (!ip.isNullOrBlank()) append("IP：").append(ip).append('\n')
+                        append("如非本人操作，请立即到「设置 → 登录设备」取消该设备登录")
+                    }
+                )
+            )
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setAutoCancel(true)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+        val mgr = context.getSystemService(NotificationManager::class.java) ?: return
+        try { mgr.notify(DEVICE_NOTIFICATION_ID, builder.build()) } catch (_: SecurityException) { /* 通知权限未开 */ }
+    }
+
+    /** 本设备在另一台设备上被取消登录（device:logout 推过来时用） */
+    fun showDeviceKickedNotification(reason: String) {
+        val builder = NotificationCompat.Builder(context, CHANNEL_DEVICES)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("已被取消登录")
+            .setContentText(reason)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setAutoCancel(true)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+        val mgr = context.getSystemService(NotificationManager::class.java) ?: return
+        try { mgr.notify(DEVICE_NOTIFICATION_ID + 1, builder.build()) } catch (_: SecurityException) { /* ignore */ }
+    }
+
     /**
      * 取消指定会话的通知（用户进入对应聊天界面时调用）
      */
@@ -115,7 +232,13 @@ class NotificationHelper(private val context: Context) {
 
     companion object {
         const val CHANNEL_ID = "sanjinchat_messages"
+        const val CHANNEL_CALLS = "sanjinchat_calls"
+        const val CHANNEL_DEVICES = "sanjinchat_devices"
         const val GROUP_MESSAGES = "sanjinchat_messages_group"
+        const val CALL_NOTIFICATION_ID = 0x5A11
+        const val DEVICE_NOTIFICATION_ID = 0x5A20
+        const val ACTION_DECLINE_CALL = "com.sanjinchat.wear.action.DECLINE_CALL"
+        const val EXTRA_ACCEPT_CALL = "extra_accept_call"
         const val EXTRA_CONVERSATION_TAG = "extra_conversation_tag"
         const val EXTRA_IS_GROUP = "extra_is_group"
         const val EXTRA_TARGET_ID = "extra_target_id"

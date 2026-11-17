@@ -48,6 +48,9 @@ data class ChatMessage(
     val image: String? = null,
     val audio: String? = null,
     val video: String? = null,
+    // 通话记录消息（contentType = "call"）专用字段
+    val callMedia: String? = null,   // "audio" / "video"
+    val callSeconds: Int = 0,        // 通话时长（秒），0 表示未接通
     val timestamp: Long
 )
 

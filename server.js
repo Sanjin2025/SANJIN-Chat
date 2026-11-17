@@ -38,6 +38,7 @@ const exposureBoardMod = require('./src/exposureBoard');
 const announcementMod = require('./src/announcement');
 const serverInfoMod = require('./src/serverInfo');
 const updateMod = require('./src/update');
+const deviceSessionsMod = require('./src/deviceSessions');
 const cleanupMod = require('./src/cleanup');
 const ChatServer = require('./src/chatServer');
 
@@ -150,6 +151,8 @@ const TLS_CONFIG = (() => {
 
 // ===== 创建聊天服务器实例 =====
 const chatServer = new ChatServer();
+// 登录设备管理：加载持久化会话 + 启动心跳
+deviceSessionsMod.init(chatServer);
 
 // ==================== HTTP 请求工具 ====================
 
@@ -817,6 +820,37 @@ async function handleHttpRequest(req, res) {
       return sendJson(res, 200, result);
     }
 
+    // ====== 登录设备管理 ======
+    // GET  /api/auth/devices  —— 返回当前用户的所有登录设备
+    // POST /api/auth/logout-device  body: { token: '...' }  —— 取消某设备的登录（立刻关 WS + 吊销 token）
+    if (urlPath === '/api/auth/devices' && req.method === 'GET') {
+      const authHeader = req.headers['authorization'] || '';
+      const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+      const user = auth.verifyToken(token);
+      if (!user) return sendJson(res, 401, { ok: false, error: '未登录' });
+      return sendJson(res, 200, {
+        ok: true,
+        currentToken: token,
+        devices: deviceSessionsMod.listForUser(user.id, token)
+      });
+    }
+    if (urlPath === '/api/auth/logout-device' && req.method === 'POST') {
+      const authHeader = req.headers['authorization'] || '';
+      const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+      const user = auth.verifyToken(token);
+      if (!user) return sendJson(res, 401, { ok: false, error: '未登录' });
+      const body = await readJsonBody(req);
+      const target = (body && body.token || '').toString();
+      if (!target) return sendJson(res, 400, { ok: false, error: '缺少 token 参数' });
+      const result = deviceSessionsMod.logoutDevice(user.id, target);
+      if (!result.ok) return sendJson(res, 404, { ok: false, error: result.error });
+      // 如果用户刚好在取消自己当前设备的登录，顺带吊销调用者自己的 token
+      if (result.revokedToken === token) {
+        auth.tokenStore.delete(token);
+      }
+      return sendJson(res, 200, { ok: true, deviceName: result.deviceName });
+    }
+
     // ====== 客户端更新检查 ======
     // GET /api/update/check?channel=stable  （公开，无需登录）
     // channel: stable / beta / 自定义 http(s) URL
@@ -902,7 +936,7 @@ async function bootstrap() {
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
   wss.on('connection', (ws, req) => {
     try {
-      chatServer.handleConnection(ws, req.url || '');
+      chatServer.handleConnection(ws, req.url || '', req);
     } catch (err) {
       // 兜底：handleConnection 内部已有 try/catch，但再保一层
       console.error('[HTTP] wss connection 异常:', err && err.message || err);

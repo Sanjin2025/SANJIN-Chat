@@ -1363,4 +1363,52 @@ class ApiClient(private val context: Context) {
             android.util.Log.e("ApiClient", "安装 APK 失败: ${e.message}")
         }
     }
+
+    // ===== 登录设备管理 =====
+
+    data class LoginDevice(
+        val token: String,
+        val deviceId: String?,
+        val deviceName: String,
+        val ip: String?,
+        val userAgent: String?,
+        val connectedAt: Long,
+        val lastSeenAt: Long,
+        val revokedAt: Long?,
+        val online: Boolean,
+        val isCurrent: Boolean
+    )
+
+    /** GET /api/auth/devices：返回当前账号的所有登录设备 */
+    suspend fun getDevices(token: String): Result<List<LoginDevice>> = authCall(token,
+        build = { b -> b.url("${baseUrl()}/api/auth/devices").get() },
+        defaultErr = "获取设备列表失败"
+    ) { _, obj ->
+        val arr = obj.optJSONArray("devices") ?: return@authCall emptyList()
+        (0 until arr.length()).mapNotNull { i ->
+            val d = arr.optJSONObject(i) ?: return@mapNotNull null
+            LoginDevice(
+                token = d.optString("token"),
+                deviceId = if (d.isNull("deviceId")) null else d.optString("deviceId"),
+                deviceName = d.optString("deviceName", "未知设备"),
+                ip = if (d.isNull("ip")) null else d.optString("ip"),
+                userAgent = if (d.isNull("userAgent")) null else d.optString("userAgent"),
+                connectedAt = d.optLong("connectedAt", 0L),
+                lastSeenAt = d.optLong("lastSeenAt", 0L),
+                revokedAt = if (d.isNull("revokedAt")) null else d.optLong("revokedAt"),
+                online = d.optBoolean("online", false),
+                isCurrent = d.optBoolean("isCurrent", false)
+            )
+        }
+    }
+
+    /** POST /api/auth/logout-device：取消指定设备的登录（立即关闭该 WS + 吊销其 token） */
+    suspend fun logoutDevice(token: String, targetToken: String): Result<String> = authCall(token,
+        build = { b ->
+            val body = JSONObject().apply { put("token", targetToken) }
+            b.url("${baseUrl()}/api/auth/logout-device")
+                .post(body.toString().toRequestBody(jsonMediaType))
+        },
+        defaultErr = "取消登录失败"
+    ) { _, obj -> obj.optString("deviceName", "") }
 }

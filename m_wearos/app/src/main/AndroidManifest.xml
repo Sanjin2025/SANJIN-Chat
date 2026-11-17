@@ -21,6 +21,8 @@
     <!-- 扫码登录：相机权限 -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <!-- 来电通知：锁屏/后台也能全屏弹出 -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <!-- 保活：前台服务 + 开机自启 + 关闭电池优化申请 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
@@ -29,6 +31,10 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <!-- 应用内更新：下载 APK 后拉起系统安装器 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 保存图片/视频到相册（Android 9 及以下） -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
     <application
         android:name=".SanjinChatApp"
@@ -62,6 +68,11 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="persistent_web_socket_connection" />
         </service>
+
+        <!-- 来电通知上的「拒绝」按钮 -->
+        <receiver
+            android:name=".notification.CallActionReceiver"
+            android:exported="false" />
 
         <!-- 应用内更新：通过 FileProvider 把下载到缓存的 APK 共享给系统安装器 -->
         <provider

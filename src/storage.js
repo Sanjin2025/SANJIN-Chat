@@ -21,7 +21,8 @@ const FILES = {
   exposureBoard: 'exposureBoard.json',
   announcements: 'announcements.json',
   serverInfo: 'serverInfo.json',
-  tokens: 'tokens.json'
+  tokens: 'tokens.json',
+  deviceSessions: 'deviceSessions.json'
 };
 
 // 内存缓存，避免频繁读写文件

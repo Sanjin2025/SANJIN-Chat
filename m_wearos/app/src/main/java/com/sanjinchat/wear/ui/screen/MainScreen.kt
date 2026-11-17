@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
@@ -150,6 +151,7 @@ private enum class DialogKind {
     KeepAlive,
     ServerInfo,
     UpdateCheck,
+    Devices,
 }
 
 /** 聊天列表条目（私聊/群聊统一模型） */
@@ -215,9 +217,38 @@ private fun buildChatEntries(
 fun MainScreen(navController: NavController) {
     val app = SanjinChatApp.instance
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
 
     val currentUser by app.webSocketClient.currentUser.collectAsState()
     val connectionState by app.webSocketClient.connectionState.collectAsState()
+
+    // 保活状态：未开启时在主页最上方展示「点击开启保活」入口
+    val keepAliveOn by app.preferenceManager.keepAlive
+        .collectAsState(initial = app.preferenceManager.isKeepAliveCached)
+    val keepAlivePermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            scope.launch {
+                app.preferenceManager.setKeepAlive(true)
+                app.ensureKeepAliveService(true)
+            }
+        } else {
+            Toast.makeText(context.applicationContext, "未授予通知权限，无法开启保活", Toast.LENGTH_SHORT).show()
+        }
+    }
+    val enableKeepAlive: () -> Unit = {
+        val needPerm = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        if (needPerm) {
+            keepAlivePermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            scope.launch {
+                app.preferenceManager.setKeepAlive(true)
+                app.ensureKeepAliveService(true)
+            }
+        }
+    }
     val friends by app.webSocketClient.friends.collectAsState()
     val groups by app.webSocketClient.groups.collectAsState()
     val friendRequests by app.webSocketClient.friendRequests.collectAsState()
@@ -320,6 +351,17 @@ fun MainScreen(navController: NavController) {
                 if (convIds.isNotEmpty()) {
                     lastMessages = app.messageCache.getLastMessages(convIds)
                 }
+            }
+        }
+    }
+
+    // 断网重连后云端同步完成：刷新会话预览与排序（补齐断网期间的消息）
+    LaunchedEffect(friends, groups) {
+        app.messageSyncSignal.collect {
+            val convIds = friends.map { MessageCache.privateConvId(it.userId) } +
+                    groups.map { MessageCache.groupConvId(it.group.id) }
+            if (convIds.isNotEmpty()) {
+                lastMessages = app.messageCache.getLastMessages(convIds)
             }
         }
     }
@@ -736,6 +778,11 @@ fun MainScreen(navController: NavController) {
                         onClose = { dialogKind = DialogKind.None },
                         initialUpdate = autoUpdate
                     )
+                    DialogKind.Devices -> DevicesPanel(
+                        app = app,
+                        scope = scope,
+                        onClose = { dialogKind = DialogKind.None }
+                    )
                     DialogKind.None -> {}
                 }
             }
@@ -787,6 +834,39 @@ fun MainScreen(navController: NavController) {
                     onClick = { currentTab = MainTab.SETTINGS },
                     modifier = Modifier.weight(1f)
                 )
+            }
+
+            // 保活未开启：主页最上方提示，点击开启后自动消失
+            AnimatedVisibility(
+                visible = !keepAliveOn,
+                enter = ExpressiveMotion.EnterSlideUp,
+                exit = ExpressiveMotion.ExitSlideDown
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = tabHPadding, vertical = 2.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.tertiaryContainer)
+                        .clickable(onClick = enableKeepAlive)
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("🔔", fontSize = 10.sp)
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        "通知保活未开启，点击开启",
+                        fontSize = 8.sp,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        "开启",
+                        fontSize = 8.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer
+                    )
+                }
             }
 
             // 连接状态提示（Expressive 动效）
@@ -1306,6 +1386,16 @@ fun MainScreen(navController: NavController) {
                                 AssistChip(
                                     onClick = { dialogKind = DialogKind.UpdateCheck },
                                     label = { Text("检查更新", color = MaterialTheme.colorScheme.secondary) },
+                                    colors = AssistChipDefaults.assistChipColors(
+                                        containerColor = MaterialTheme.colorScheme.surface
+                                    ),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                            item {
+                                AssistChip(
+                                    onClick = { dialogKind = DialogKind.Devices },
+                                    label = { Text("登录设备管理", color = MaterialTheme.colorScheme.secondary) },
                                     colors = AssistChipDefaults.assistChipColors(
                                         containerColor = MaterialTheme.colorScheme.surface
                                     ),
@@ -2431,6 +2521,8 @@ private fun SectionHeader(title: String) {
 }
 
 private fun formatMsgPreview(msg: ChatMessage): String {
+    // 通话记录直接显示「通话时长 02:13 / 对方已取消」等文案
+    if (msg.contentType == "call") return msg.content
     val sender = msg.fromNickname.ifBlank { msg.fromId }
     val body = when (msg.contentType) {
         "image" -> "[图片]"
@@ -4630,6 +4722,7 @@ private fun KeepAlivePanel(onClose: () -> Unit) {
     var batteryOpted by remember { mutableStateOf<Boolean?>(null) }
     var notifGranted by remember { mutableStateOf<Boolean?>(null) }
     var log by remember { mutableStateOf<String?>(null) }
+    var rootBusy by remember { mutableStateOf(false) }
 
     val notificationPermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -4810,6 +4903,67 @@ private fun KeepAlivePanel(onClose: () -> Unit) {
             }
         }
         Spacer(Modifier.height(3.dp))
+        // ===== Root 一键保活（适用于没有系统设置界面的手表） =====
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .background(MaterialTheme.colorScheme.surface)
+                .padding(5.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Root 一键保活", fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "手表没有系统设置界面时使用：自动加入 Doze 白名单、允许后台运行、补授通知权限（需要 root）。",
+                    fontSize = 8.sp,
+                    color = OnSurfaceVariant
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .padding(start = 6.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(
+                        if (rootBusy) MaterialTheme.colorScheme.surfaceVariant
+                        else MaterialTheme.colorScheme.secondary
+                    )
+                    .clickable {
+                        if (rootBusy) return@clickable
+                        rootBusy = true
+                        log = "正在申请 root 权限…"
+                        scope.launch {
+                            val pkg = context.packageName
+                            val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                if (!com.sanjinchat.wear.keepalive.RootKeepAlive.isAvailable()) {
+                                    com.sanjinchat.wear.keepalive.RootKeepAlive.Result(
+                                        false, "未检测到 root 权限（请先给本应用授权 su）"
+                                    )
+                                } else {
+                                    com.sanjinchat.wear.keepalive.RootKeepAlive.enable(pkg)
+                                }
+                            }
+                            rootBusy = false
+                            log = result.message
+                            if (result.ok) {
+                                // 系统侧已放行，顺便把前台常驻通知一起开起来
+                                app.preferenceManager.setKeepAlive(true)
+                                app.ensureKeepAliveService(true)
+                                keepEnabled = true
+                                refreshChecks()
+                            }
+                        }
+                    }
+                    .padding(horizontal = 8.dp, vertical = 3.dp)
+            ) {
+                Text(
+                    if (rootBusy) "执行中…" else "一键开启",
+                    fontSize = 9.sp,
+                    color = MaterialTheme.colorScheme.onSecondary
+                )
+            }
+        }
+        Spacer(Modifier.height(3.dp))
         TextButton(onClick = { refreshChecks() }) { Text("重新检测状态", fontSize = 9.sp) }
 
         log?.let {
@@ -4826,5 +4980,213 @@ private fun KeepAlivePanel(onClose: () -> Unit) {
                 contentColor = MaterialTheme.colorScheme.onSurface
             )
         ) { Text("关闭", fontSize = 10.sp) }
+    }
+}
+
+/** 登录设备管理面板：显示当前账号所有登录设备，可取消非当前设备 */
+@Composable
+private fun DevicesPanel(
+    app: com.sanjinchat.wear.SanjinChatApp,
+    scope: kotlinx.coroutines.CoroutineScope,
+    onClose: () -> Unit
+) {
+    val context = LocalContext.current
+    var devices by remember { mutableStateOf<List<com.sanjinchat.wear.network.ApiClient.LoginDevice>?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var refreshing by remember { mutableStateOf(false) }
+    var revokingToken by remember { mutableStateOf<String?>(null) }
+
+    suspend fun loadDevices() {
+        val token = app.preferenceManager.token.first().orEmpty()
+        if (token.isBlank()) { loading = false; error = "未登录"; return }
+        refreshing = devices != null
+        loading = !refreshing
+        error = null
+        app.apiClient.getDevices(token)
+            .onSuccess { list ->
+                devices = list.sortedWith(
+                    compareByDescending<com.sanjinchat.wear.network.ApiClient.LoginDevice> { it.isCurrent }
+                        .thenByDescending { it.online }
+                        .thenByDescending { it.lastSeenAt }
+                )
+            }
+            .onFailure { error = it.message ?: "获取失败" }
+        loading = false
+        refreshing = false
+    }
+
+    LaunchedEffect(Unit) { loadDevices() }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 8.dp)
+    ) {
+        PageHeader(title = "登录设备", onBack = onClose)
+        Spacer(Modifier.height(6.dp))
+
+        AssistChip(
+            onClick = { scope.launch { loadDevices() } },
+            label = { Text(if (refreshing) "刷新中…" else "刷新", fontSize = 9.sp, color = MaterialTheme.colorScheme.secondary) },
+            colors = AssistChipDefaults.assistChipColors(containerColor = MaterialTheme.colorScheme.surface),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(6.dp))
+
+        when {
+            loading -> {
+                CircularProgressIndicator(
+                    modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 20.dp),
+                    strokeWidth = 2.dp
+                )
+            }
+            error != null -> {
+                Text(
+                    text = error!!,
+                    color = ErrorLight,
+                    fontSize = 10.sp,
+                    modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 16.dp)
+                )
+            }
+            devices.isNullOrEmpty() -> {
+                Text(
+                    text = "暂无登录设备",
+                    color = MaterialTheme.colorScheme.secondary,
+                    fontSize = 10.sp,
+                    modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 16.dp)
+                )
+            }
+            else -> devices!!.forEach { dev ->
+                DeviceCard(
+                    device = dev,
+                    revoking = revokingToken == dev.token,
+                    onRevoke = {
+                        scope.launch {
+                            revokingToken = dev.token
+                            val token = app.preferenceManager.token.first().orEmpty()
+                            app.apiClient.logoutDevice(token, dev.token)
+                                .onSuccess {
+                                    if (dev.isCurrent) {
+                                        app.webSocketClient.disconnect()
+                                        app.clearMessageCache()
+                                        app.preferenceManager.clearLoginInfo()
+                                        revokingToken = null
+                                        onClose()
+                                        context.startActivity(
+                                            android.content.Intent(context, com.sanjinchat.wear.MainActivity::class.java).apply {
+                                                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                                            }
+                                        )
+                                    } else {
+                                        Toast.makeText(context, "已取消 ${dev.deviceName} 的登录", Toast.LENGTH_SHORT).show()
+                                        loadDevices()
+                                    }
+                                }
+                                .onFailure {
+                                    Toast.makeText(context, "取消失败：${it.message}", Toast.LENGTH_SHORT).show()
+                                }
+                            revokingToken = null
+                        }
+                    }
+                )
+                Spacer(Modifier.height(4.dp))
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Button(
+            onClick = onClose,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface
+            )
+        ) { Text("关闭", fontSize = 10.sp) }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = "提示：取消登录后，该设备会立即掉线且其登录凭证永久失效。",
+            color = MaterialTheme.colorScheme.secondary,
+            fontSize = 8.sp
+        )
+    }
+}
+
+@Composable
+private fun DeviceCard(
+    device: com.sanjinchat.wear.network.ApiClient.LoginDevice,
+    revoking: Boolean,
+    onRevoke: () -> Unit
+) {
+    val context = LocalContext.current
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(modifier = Modifier.padding(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = device.deviceName.ifBlank { "未知设备" },
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f)
+                )
+                if (device.isCurrent) {
+                    Text(
+                        text = "当前",
+                        fontSize = 8.sp,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(start = 4.dp)
+                    )
+                }
+                Text(
+                    text = if (device.online) "在线" else "离线",
+                    fontSize = 8.sp,
+                    color = if (device.online) androidx.compose.ui.graphics.Color(0xFF4CAF50)
+                            else MaterialTheme.colorScheme.secondary,
+                    modifier = Modifier.padding(start = 4.dp)
+                )
+            }
+            Spacer(Modifier.height(2.dp))
+            val timeText = remember(device.connectedAt, device.lastSeenAt, device.online) {
+                val now = System.currentTimeMillis()
+                val base = if (device.online) device.lastSeenAt else device.connectedAt
+                val diffMin = ((now - base) / 60000L).coerceAtLeast(0L)
+                when {
+                    diffMin < 1 -> "刚刚"
+                    diffMin < 60 -> "${diffMin} 分钟前"
+                    diffMin < 1440 -> "${diffMin / 60} 小时前"
+                    else -> "${diffMin / 1440} 天前"
+                }
+            }
+            Text(
+                text = buildString {
+                    device.ip?.let { append("IP：$it  ") }
+                    append("${if (device.online) "最后活跃" else "登录"}：$timeText")
+                },
+                fontSize = 9.sp,
+                color = MaterialTheme.colorScheme.secondary
+            )
+            Spacer(Modifier.height(4.dp))
+            Button(
+                onClick = onRevoke,
+                enabled = !revoking,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = ErrorDeep,
+                    contentColor = ErrorLight
+                ),
+                contentPadding = PaddingValues(vertical = 2.dp)
+            ) {
+                Text(
+                    text = if (revoking) "处理中…"
+                           else if (device.isCurrent) "取消本设备登录"
+                           else "取消该设备登录",
+                    fontSize = 9.sp
+                )
+            }
+        }
     }
 }

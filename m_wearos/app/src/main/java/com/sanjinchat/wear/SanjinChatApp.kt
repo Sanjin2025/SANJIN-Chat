@@ -14,8 +14,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -73,15 +76,45 @@ class SanjinChatApp : Application() {
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var notificationJob: Job? = null
 
+    /** 断网重连后完成云端消息同步的信号：聊天页 / 会话列表据此刷新 */
+    private val _messageSyncSignal = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
+    val messageSyncSignal: SharedFlow<Unit> = _messageSyncSignal.asSharedFlow()
+
+    /** 上次成功同步的时刻；只有比它更新的消息才算"断网期间漏收" */
+    @Volatile
+    private var lastSyncAt: Long = 0L
+
     override fun onCreate() {
         super.onCreate()
         instance = this
+        // 崩溃日志写入文件：方便排查闪退（如 WebRTC 视频通话相关 native crash）
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            runCatching {
+                val dir = getExternalFilesDir(null) ?: filesDir
+                val file = java.io.File(dir, "crash_${System.currentTimeMillis()}.log")
+                file.writeText(
+                    "thread=${thread.name}\n" +
+                        "time=${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())}\n\n" +
+                        throwable.stackTraceToString()
+                )
+            }
+            defaultHandler?.uncaughtException(thread, throwable)
+        }
+
         preferenceManager = PreferenceManager(this)
         apiClient = ApiClient(this)
         webSocketClient = ChatWebSocketClient()
         notificationHelper = NotificationHelper(this)
         messageCache = MessageCache(this)
         callManager = com.sanjinchat.wear.call.CallManager(this, webSocketClient)
+
+        // 设备标识：每台设备首次启动生成一次 UUID，上报给服务端，用于多设备登录识别
+        runCatching {
+            ChatWebSocketClient.deviceId = runBlocking { preferenceManager.getOrPutDeviceId() }
+            @Suppress("DEPRECATION")
+            ChatWebSocketClient.deviceName = android.os.Build.MODEL?.takeIf { it.isNotBlank() } ?: "未知设备"
+        }
 
         // 默认使用固定服务器地址 + ws 协议，用户可在主界面「高级设置」修改
         val defaultAddress = "chat.sanjinx.com:8181"
@@ -102,6 +135,40 @@ class SanjinChatApp : Application() {
 
         // 监听 WebSocket 消息事件，在收到新消息时发送系统通知
         startMessageNotificationListener()
+
+        // 通话记录：无论用户是否停留在聊天页，都写入本地消息缓存
+        appScope.launch {
+            callManager.callLogs.collect { log ->
+                runCatching {
+                    val meId = webSocketClient.currentUser.value?.id ?: ""
+                    val msg = com.sanjinchat.wear.model.ChatMessage(
+                        id = "call_${log.timestamp}",
+                        type = "private_message",
+                        fromId = meId,
+                        fromNickname = "",
+                        toId = log.peerId,
+                        contentType = "call",
+                        content = log.label,
+                        callMedia = log.media,
+                        callSeconds = log.durationSec,
+                        timestamp = log.timestamp
+                    )
+                    messageCache.saveMessage(MessageCache.privateConvId(log.peerId), msg)
+                }
+            }
+        }
+
+        // 来电通知的自动清理：接通/挂断/拒接后撤掉通知栏里的来电提醒
+        appScope.launch {
+            callManager.state.collect { st ->
+                if (st is com.sanjinchat.wear.call.CallState.Active ||
+                    st is com.sanjinchat.wear.call.CallState.Connecting ||
+                    st is com.sanjinchat.wear.call.CallState.Idle
+                ) {
+                    runCatching { notificationHelper.cancelIncomingCallNotification() }
+                }
+            }
+        }
 
         // 保活：如果用户之前打开常驻通知，则启动前台服务（跨冷启动自动恢复）
         val keepAlive = runBlocking { preferenceManager.keepAlive.first() }
@@ -132,26 +199,34 @@ class SanjinChatApp : Application() {
                 // 从云端同步最近 10 天消息到本地缓存，并清理本地过期消息
                 val myId = savedUserId
                 if (!myId.isNullOrBlank()) {
-                    runCatching { apiClient.syncMessages(token).getOrNull() }
-                        .getOrNull()
-                        ?.let { msgs ->
-                            for (msg in msgs) {
-                                val convId = when {
-                                    msg.type == "private_message" && msg.fromId == myId ->
-                                        msg.toId?.let { MessageCache.privateConvId(it) }
-                                    msg.type == "private_message" ->
-                                        MessageCache.privateConvId(msg.fromId)
-                                    msg.type == "group_message" && !msg.groupId.isNullOrBlank() ->
-                                        MessageCache.groupConvId(msg.groupId!!)
-                                    else -> null
-                                }
-                                if (convId != null) {
-                                    messageCache.saveMessage(convId, msg)
-                                }
-                            }
-                        }
+                    // 冷启动不把历史消息计为"未读"，只把之后的断线漏收算作新消息
+                    lastSyncAt = System.currentTimeMillis()
+                    runCatching { syncMessagesFromServer(token, myId, countMissedAsUnread = false) }
                     // 本地清理：删除 10 天前的消息（含文本/语音/图片）
                     messageCache.cleanupExpired()
+                }
+            }
+        }
+
+        // 断网重连：恢复连接后自动从服务器拉取消息，补齐断网期间对方发来的消息
+        appScope.launch {
+            var hasEverConnected = false
+            webSocketClient.connectionState.collect { state ->
+                if (state is ConnectionState.Connected) {
+                    // 首次连上由冷启动流程同步；之后每次重新连上都视为"断线恢复"
+                    if (hasEverConnected) {
+                        val token = webSocketClient.currentToken
+                        val myId = state.user.id.ifBlank {
+                            webSocketClient.currentUser.value?.id.orEmpty()
+                        }
+                        if (!token.isNullOrBlank() && myId.isNotBlank()) {
+                            runCatching {
+                                syncMessagesFromServer(token, myId, countMissedAsUnread = true)
+                                _messageSyncSignal.tryEmit(Unit)
+                            }
+                        }
+                    }
+                    hasEverConnected = true
                 }
             }
         }
@@ -204,6 +279,70 @@ class SanjinChatApp : Application() {
         } catch (_: Throwable) { /* ignore */ }
     }
 
+    /**
+     * 从服务器拉取最近 10 天消息，与本地缓存按消息 id 比对去重后写入。
+     *
+     * @param countMissedAsUnread 是否把 lastSyncAt 之后、别人发来的消息算作"断网期间漏收"：
+     *        计入未读红点并弹通知。冷启动传 false，避免把历史消息全部标成未读。
+     */
+    private suspend fun syncMessagesFromServer(
+        token: String,
+        myId: String,
+        countMissedAsUnread: Boolean
+    ) {
+        val since = lastSyncAt
+        val msgs = apiClient.syncMessages(token).getOrNull() ?: return
+        for (msg in msgs) {
+            val convId = when {
+                msg.type == "private_message" && msg.fromId == myId ->
+                    msg.toId?.let { MessageCache.privateConvId(it) }
+                msg.type == "private_message" ->
+                    MessageCache.privateConvId(msg.fromId)
+                msg.type == "group_message" && !msg.groupId.isNullOrBlank() ->
+                    MessageCache.groupConvId(msg.groupId!!)
+                else -> null
+            } ?: continue
+            // 按 id 去重，本地已有的不会重复
+            messageCache.saveMessage(convId, msg)
+
+            if (!countMissedAsUnread) continue
+            if (msg.fromId == myId) continue
+            if (msg.timestamp <= since) continue
+
+            // 断线期间别人发来的新消息：计未读 + 弹通知（当前正在看的会话只清未读）
+            val peerId = if (msg.type == "private_message") msg.fromId else msg.groupId.orEmpty()
+            if (peerId.isBlank()) continue
+            if (activeConversation == peerId) {
+                webSocketClient.clearUnread(convId)
+                continue
+            }
+            webSocketClient.bumpUnread(convId)
+            runCatching {
+                val sender = msg.fromNickname.ifBlank { msg.fromId }
+                if (msg.type == "group_message") {
+                    val groupName = webSocketClient.groups.value
+                        .firstOrNull { it.group.id == peerId }?.group?.name
+                        ?.takeIf { it.isNotBlank() } ?: "群聊"
+                    notificationHelper.showMessageNotification(
+                        msg = msg,
+                        senderName = groupName,
+                        conversationTag = peerId,
+                        bodySenderName = sender,
+                        extraName = groupName
+                    )
+                } else {
+                    notificationHelper.showMessageNotification(
+                        msg = msg,
+                        senderName = sender,
+                        conversationTag = peerId,
+                        extraName = sender
+                    )
+                }
+            }
+        }
+        lastSyncAt = System.currentTimeMillis()
+    }
+
     private fun startMessageNotificationListener() {
         notificationJob?.cancel()
         // 死循环 + Supervisor：任何异常（存文件/弹通知失败等）都只跳过这一条，继续 collect，确保永远不中断接收
@@ -213,6 +352,17 @@ class SanjinChatApp : Application() {
                     webSocketClient.events.collect { event ->
                         // 通话信令交给 CallManager 处理
                         runCatching { callManager.handleEvent(event) }
+                        // 收到通话邀请：无论应用在前台还是后台，都弹系统通知
+                        if (event is ChatEvent.CallInvite) {
+                            val st = callManager.state.value
+                            if (st is com.sanjinchat.wear.call.CallState.Incoming) {
+                                runCatching {
+                                    notificationHelper.showIncomingCallNotification(
+                                        st.peerId, st.peerName, st.media
+                                    )
+                                }
+                            }
+                        }
                         // 每条事件独立子协程 + runCatching 包裹，单条失败绝不打断后续 collect
                         launch {
                             runCatching {
@@ -224,18 +374,19 @@ class SanjinChatApp : Application() {
                                         val convId = MessageCache.privateConvId(otherId)
                                         messageCache.saveMessage(convId, msg)
                                         if (msg.fromId == cu) return@runCatching
+                                        // 即使正在看这个会话，也照样弹通知（只是不再累计未读）
                                         if (activeConversation != msg.fromId) {
                                             webSocketClient.bumpUnread(convId)
-                                            val sender = msg.fromNickname.ifBlank { msg.fromId }
-                                            notificationHelper.showMessageNotification(
-                                                msg = msg,
-                                                senderName = sender,
-                                                conversationTag = msg.fromId,
-                                                extraName = sender
-                                            )
                                         } else {
                                             webSocketClient.clearUnread(convId)
                                         }
+                                        val sender = msg.fromNickname.ifBlank { msg.fromId }
+                                        notificationHelper.showMessageNotification(
+                                            msg = msg,
+                                            senderName = sender,
+                                            conversationTag = msg.fromId,
+                                            extraName = sender
+                                        )
                                     }
                                     is ChatEvent.GroupMessage -> {
                                         val msg = event.message
@@ -244,22 +395,47 @@ class SanjinChatApp : Application() {
                                         messageCache.saveMessage(convId, msg)
                                         val cu = webSocketClient.currentUser.value?.id
                                         if (msg.fromId == cu) return@runCatching
+                                        // 即使正在看这个群，也照样弹通知（只是不再累计未读）
                                         if (activeConversation != gid) {
                                             webSocketClient.bumpUnread(convId)
-                                            val sender = msg.fromNickname.ifBlank { msg.fromId }
-                                            // 群通知：标题显示群名，正文显示「发送者：内容」
-                                            val groupName = webSocketClient.groups.value
-                                                .firstOrNull { it.group.id == gid }?.group?.name
-                                                ?.takeIf { it.isNotBlank() } ?: "群聊"
-                                            notificationHelper.showMessageNotification(
-                                                msg = msg,
-                                                senderName = groupName,
-                                                conversationTag = gid,
-                                                bodySenderName = sender,
-                                                extraName = groupName
-                                            )
                                         } else {
                                             webSocketClient.clearUnread(convId)
+                                        }
+                                        val sender = msg.fromNickname.ifBlank { msg.fromId }
+                                        // 群通知：标题显示群名，正文显示「发送者：内容」
+                                        val groupName = webSocketClient.groups.value
+                                            .firstOrNull { it.group.id == gid }?.group?.name
+                                            ?.takeIf { it.isNotBlank() } ?: "群聊"
+                                        notificationHelper.showMessageNotification(
+                                            msg = msg,
+                                            senderName = groupName,
+                                            conversationTag = gid,
+                                            bodySenderName = sender,
+                                            extraName = groupName
+                                        )
+                                    }
+                                    is ChatEvent.DeviceLogin -> {
+                                        notificationHelper.showDeviceLoginNotification(
+                                            event.deviceName, event.ip
+                                        )
+                                    }
+                                    is ChatEvent.DeviceLogout -> {
+                                        // 本设备被其他设备踢下线：弹通知 + 断开 + 跳登录页
+                                        notificationHelper.showDeviceKickedNotification(event.reason)
+                                        appScope.launch {
+                                            runCatching { webSocketClient.disconnect() }
+                                            // 跳登录页（直接切状态）
+                                            runCatching {
+                                                val navIntent = android.content.Intent(
+                                                    this@SanjinChatApp,
+                                                    com.sanjinchat.wear.MainActivity::class.java
+                                                ).apply {
+                                                    flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                                                            android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+                                                    putExtra("force_logout", event.reason)
+                                                }
+                                                startActivity(navIntent)
+                                            }
                                         }
                                     }
                                     else -> {}

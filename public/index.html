@@ -242,7 +242,8 @@ a { color: var(--md-primary); text-decoration: none; }
     friends: [], groups: [], friendRequests: [], announcements: [],
     serverInfo: null,
     chatMessages: {}, lastPresence: {}, newMessageCount: {},
-    mediaRecorder: null, audioChunks: [], audioStartTs: 0
+    mediaRecorder: null, audioChunks: [], audioStartTs: 0,
+    exposureFilterTag: ''
   };
   function chatKey(t, id) { return t + ':' + id; }
   // 解析 API 基址：
@@ -356,11 +357,21 @@ a { color: var(--md-primary); text-decoration: none; }
   };
 
   // ================= 渲染入口 =================
+  // 关键：不要在这里强制覆盖 state.currentPage —— 子页面（如曝光板）会先设好再调 render()
+  // 只有未登录 → login，已登录但 currentPage 是 login → main（登录流程进来）
   function render() {
     const app = $('#app');
     app.innerHTML = '';
-    if (!state.token || !state.me) { state.currentPage = 'login'; renderLogin(app); }
-    else { state.currentPage = 'main'; renderMain(app); }
+    if (!state.token || !state.me) {
+      state.currentPage = 'login';
+      renderLogin(app);
+      return;
+    }
+    const p = state.currentPage;
+    if (p === 'login' || p == null || p === '') state.currentPage = 'main';
+    const cur = state.currentPage;
+    if (cur === 'exposure-board') renderExposureBoard(app);
+    else renderMain(app);
   }
 
   // ================= 登录/注册页 =================
@@ -2126,10 +2137,15 @@ a { color: var(--md-primary); text-decoration: none; }
     } catch (e) { if (m) m.body.innerHTML = `<p style="color:var(--md-error);text-align:center;padding:20px">${e.message}</p>`; }
   }
 
-  /** 打开曝光板浏览页 */
-  async function openExposureBoard(filterTag) {
+  /** 打开曝光板浏览页（设置状态后交给 renderExposureBoard 渲染） */
+  function openExposureBoard(filterTag) {
+    state.exposureFilterTag = filterTag || '';
     state.currentPage = 'exposure-board';
     render();
+  }
+
+  /** 渲染曝光板浏览页（独立函数，render() 会调它，这样 WS 触发重渲染也不会把页面顶掉） */
+  function renderExposureBoard(app) {
     const page = $el('div', { class: 'page' });
     const title = $el('div', { class: 'page-title' }, [
       $el('button', { class: 'icon-btn', onclick: () => { state.currentPage = 'main'; render(); } }, '←'),
@@ -2149,7 +2165,7 @@ a { color: var(--md-primary); text-decoration: none; }
     const list = $el('div', { class: 'exposure-list', style: { padding: '0 12px 120px' } });
     page.appendChild(list);
 
-    let currentTag = filterTag || '';
+    let currentTag = state.exposureFilterTag || '';
     if (currentTag) searchI.value = currentTag;
 
     async function load(p = 1) {
@@ -2200,7 +2216,6 @@ a { color: var(--md-primary); text-decoration: none; }
             const msg = prompt(`给 @${it.username} 发送好友请求（附言可选）`, `嗨，我是 @${state.me.username}，从曝光板来的～`);
             if (msg === null) return;
             try {
-              // 先查 userId: 搜索用户名
               const su = await http('/search/users', { method: 'POST', json: { keyword: it.username } });
               const u = (su.users || []).find(x => x.username === it.username);
               if (!u) return toast('找不到该用户', 'error');
@@ -2230,11 +2245,11 @@ a { color: var(--md-primary); text-decoration: none; }
       }
     }
     addB.onclick = () => openEditExposure();
-    searchB.onclick = () => { currentTag = searchI.value.trim(); load(1); };
-    searchI.addEventListener && searchI.addEventListener('keydown', (e) => { if (e.key === 'Enter') { currentTag = searchI.value.trim(); load(1); } });
+    searchB.onclick = () => { currentTag = searchI.value.trim(); state.exposureFilterTag = currentTag; load(1); };
+    searchI.addEventListener && searchI.addEventListener('keydown', (e) => { if (e.key === 'Enter') { currentTag = searchI.value.trim(); state.exposureFilterTag = currentTag; load(1); } });
     load(1);
 
-    $('#app').appendChild(page);
+    app.appendChild(page);
   }
 
   // 初始化

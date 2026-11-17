@@ -3,6 +3,7 @@
 
 const storage = require('./storage');
 const auth = require('./auth');
+const deviceSessions = require('./deviceSessions');
 
 /**
  * 聊天服务器类
@@ -16,16 +17,18 @@ class ChatServer {
     /** 回调：当需要通知 HTTP 层（如公告推送） */
     this.announcementCallback = null;
     this.pairCallback = null;
+    // 让 deviceSessions 模块能访问 userSockets 来推送通知
+    deviceSessions.attachChatServer(this);
   }
 
   /**
    * 处理新的 WebSocket 连接
    * @param {WebSocket} ws
    */
-  handleConnection(ws, url) {
+  handleConnection(ws, url, req) {
     // 整个连接流程外包 try/catch，避免任何同步异常导致进程崩溃
     try {
-      // URL 中携带 token：ws://host?token=xxx
+      // URL 中携带 token：ws://host?token=xxx&deviceId=xxx&deviceName=xxx
       let token = null;
       try {
         const queryIdx = url.indexOf('?');
@@ -52,6 +55,9 @@ class ChatServer {
       // 注册连接
       this._registerSocket(ws, user);
 
+      // 登记 / 刷新 登录设备会话（新设备登录会自动向同 userId 的其他在线 WS 推通知）
+      deviceSessions.registerSession(ws, token, user, req, url);
+
       // 欢迎消息
       this._send(ws, { type: 'connected', user, timestamp: Date.now() });
 
@@ -64,7 +70,10 @@ class ChatServer {
       this._sendFriendRequests(user.id);
 
       ws.on('message', (data) => this._handleMessage(ws, data));
-      ws.on('close', () => this._handleClose(ws));
+      ws.on('close', () => {
+        deviceSessions.markDisconnected(ws);
+        this._handleClose(ws);
+      });
       ws.on('error', (e) => {
         console.error('[Chat] socket error:', e.message);
         this._handleClose(ws);

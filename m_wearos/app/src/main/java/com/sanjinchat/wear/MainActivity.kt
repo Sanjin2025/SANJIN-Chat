@@ -57,6 +57,15 @@ import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
 
+    /** 从来电通知点「接听」进入时，先补齐权限再自动接听 */
+    private val callPermissionLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        val audioOk = grants[android.Manifest.permission.RECORD_AUDIO]
+            ?: SanjinChatApp.instance.callManager.hasAudioPermission()
+        if (audioOk) runCatching { SanjinChatApp.instance.callManager.accept() }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -93,6 +102,8 @@ class MainActivity : ComponentActivity() {
 
         // 从通知点进来的：记录待打开会话，等主界面就绪后跳转
         handleNotificationIntent(intent)
+        // 从来电通知点「接听」进来的：自动接听
+        handleCallIntent(intent)
 
         setContent {
             val app = SanjinChatApp.instance
@@ -120,6 +131,27 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleNotificationIntent(intent)
+        handleCallIntent(intent)
+    }
+
+    /** 来电通知的「接听」：补齐麦克风/相机权限后直接接听 */
+    private fun handleCallIntent(intent: android.content.Intent?) {
+        val accept = intent?.getBooleanExtra(
+            com.sanjinchat.wear.notification.NotificationHelper.EXTRA_ACCEPT_CALL, false
+        ) ?: false
+        if (!accept) return
+        intent!!.removeExtra(com.sanjinchat.wear.notification.NotificationHelper.EXTRA_ACCEPT_CALL)
+
+        val cm = SanjinChatApp.instance.callManager
+        val st = cm.state.value as? com.sanjinchat.wear.call.CallState.Incoming ?: return
+        val need = mutableListOf<String>()
+        if (!cm.hasAudioPermission()) need += android.Manifest.permission.RECORD_AUDIO
+        if (st.media == "video" && !cm.hasCameraPermission()) need += android.Manifest.permission.CAMERA
+        if (need.isEmpty()) {
+            runCatching { cm.accept() }
+        } else {
+            callPermissionLauncher.launch(need.toTypedArray())
+        }
     }
 
     /** 解析通知携带的会话信息，交给 MainScreen 在进入主界面后跳转 */
