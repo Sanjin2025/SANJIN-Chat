@@ -178,6 +178,12 @@ class SanjinChatApp : Application() {
         // 注意：token 校验与 WebSocket 连接统一交给 BootScreen 的自动登录流程，这里不再 connect，
         // 避免 Application 与启动页两个 connect 互相关闭对方 socket（之前"卡在连接中"的根因之一）
         appScope.launch {
+            // 拉取服务端 ICE 配置（含 TURN）。跨网络通话必须有 TURN 中继，仅靠 STUN 会卡在「正在接通」
+            runCatching { apiClient.getIceServers().getOrNull() }
+                .getOrNull()
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { callManager.applyIceServers(it) }
+
             val token = preferenceManager.token.first()
             if (!token.isNullOrBlank()) {
                 val savedUserId = preferenceManager.userId.first()

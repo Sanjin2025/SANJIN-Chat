@@ -1411,4 +1411,52 @@ class ApiClient(private val context: Context) {
         },
         defaultErr = "取消登录失败"
     ) { _, obj -> obj.optString("deviceName", "") }
+
+    // ===== 通话 ICE 配置 =====
+
+    /** 一条 ICE 服务器配置（STUN 无账号密码，TURN 需要） */
+    data class IceServerConfig(
+        val urls: List<String>,
+        val username: String?,
+        val credential: String?
+    )
+
+    /** GET /api/call/ice：获取 STUN/TURN 列表（公开接口，跨网络通话依赖 TURN 中继） */
+    suspend fun getIceServers(): Result<List<IceServerConfig>> = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url("${baseUrl()}/api/call/ice")
+                .get()
+                .build()
+            client().newCall(request).execute().use { response ->
+                val body = response.body?.string() ?: ""
+                val obj = JSONObject(body)
+                val arr = obj.optJSONArray("iceServers")
+                    ?: return@use Result.success(emptyList())
+                val list = (0 until arr.length()).mapNotNull { i ->
+                    val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                    val urls = mutableListOf<String>()
+                    when {
+                        o.has("urls") && o.opt("urls") is JSONArray -> {
+                            val ua = o.optJSONArray("urls")!!
+                            for (j in 0 until ua.length()) {
+                                ua.optString(j).takeIf { it.isNotBlank() }?.let(urls::add)
+                            }
+                        }
+                        o.optString("urls").isNotBlank() -> urls.add(o.optString("urls"))
+                        o.optString("url").isNotBlank() -> urls.add(o.optString("url"))
+                    }
+                    if (urls.isEmpty()) return@mapNotNull null
+                    IceServerConfig(
+                        urls = urls,
+                        username = o.optString("username").takeIf { it.isNotBlank() },
+                        credential = o.optString("credential").takeIf { it.isNotBlank() }
+                    )
+                }
+                Result.success(list)
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
 }

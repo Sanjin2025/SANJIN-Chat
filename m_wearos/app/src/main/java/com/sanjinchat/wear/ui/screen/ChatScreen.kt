@@ -149,6 +149,12 @@ fun ChatScreen(
     // 待回显的本地乐观消息映射：key = 本地消息 id("local_...") → 超时 Job
     val pendingLocalIds = remember { mutableStateMapOf<String, Job>() }
 
+    // 设备是否支持 WebRTC 通话（小天才等裁剪 ROM 不支持时隐藏通话按钮）
+    var callSupported by remember { mutableStateOf(true) }
+    LaunchedEffect(Unit) {
+        callSupported = app.callManager.isCallSupported()
+    }
+
     // ===== 通话：麦克风/相机权限 + 发起呼叫 =====
     var pendingCallMedia by remember { mutableStateOf<String?>(null) }
     val callPermissionLauncher = rememberLauncherForActivityResult(
@@ -734,7 +740,7 @@ fun ChatScreen(
                     fontSize = 10.sp
                 )
             }
-            if (chatType is ChatType.Private) {
+            if (chatType is ChatType.Private && callSupported) {
                 Spacer(modifier = Modifier.width(4.dp))
                 HeaderIconButton("📞") { startCall("audio") }
                 Spacer(modifier = Modifier.width(4.dp))

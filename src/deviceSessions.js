@@ -190,7 +190,7 @@ function markDisconnected(ws) {
 
 /** HTTP GET /api/auth/devices：返回指定用户的全部会话 */
 function listForUser(userId, currentToken) {
-  const arr = sessionsByUser.get(userId) || [];
+  const arr = (sessionsByUser.get(userId) || []).filter(r => !r.revokedAt);
   return arr.map(r => ({
     token: r.token,
     deviceId: r.deviceId,

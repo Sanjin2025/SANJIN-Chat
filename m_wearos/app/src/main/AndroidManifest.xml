@@ -74,6 +74,18 @@
             android:name=".notification.CallActionReceiver"
             android:exported="false" />
 
+        <!-- 开机自启 / 应用更新后自启保活服务 -->
+        <receiver
+            android:name=".keepalive.BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
         <!-- 应用内更新：通过 FileProvider 把下载到缓存的 APK 共享给系统安装器 -->
         <provider
             android:name="androidx.core.content.FileProvider"

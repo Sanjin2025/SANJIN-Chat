@@ -45,11 +45,7 @@ import java.util.Locale
 /**
  * 全屏通话浮层：覆盖在导航之上，任何页面收到来电都会立刻显示。
  *
- * 关键点（视频显示）：
- * SurfaceViewRenderer 的 Surface 默认位于窗口【之下】，因此视频模式下
- * 根布局绝不能画不透明背景，否则会把 Surface 挡死（之前"只看到半透明背景"就是这个原因）。
- * 远端画面用默认 z-order，本地小窗用 setZOrderMediaOverlay 叠在远端之上，
- * 控制按钮由 Compose 绘制在窗口层，天然位于两者之上。
+ * 渲染器：SurfaceViewRenderer（小天才等设备的视频渲染走硬件合成层）。
  */
 @Composable
 fun CallOverlay() {
@@ -199,7 +195,7 @@ fun CallOverlay() {
     }
 }
 
-/** WebRTC 官方 SurfaceViewRenderer，绑定/解绑本地/远端视频轨 */
+/** WebRTC SurfaceViewRenderer，绑定/解绑本地/远端视频轨 */
 @Composable
 private fun VideoSurface(
     modifier: Modifier,

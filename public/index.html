@@ -648,6 +648,18 @@ a { color: var(--md-primary); text-decoration: none; }
     }
   }
   function closeCallUI() { const ov = document.getElementById('call-overlay'); if (ov) ov.remove(); }
+  let iceServersLoaded = false;
+  // 从服务端拉取 ICE 配置（含 TURN）。跨网络通话必须依赖 TURN 中继，仅 STUN 会卡在「正在接通」
+  async function ensureIceServers() {
+    if (iceServersLoaded) return;
+    try {
+      const d = await http('/api/call/ice');
+      if (Array.isArray(d.iceServers) && d.iceServers.length) {
+        call.iceServers = d.iceServers;
+        iceServersLoaded = true;
+      }
+    } catch (e) { /* 拉取失败则继续用内置 STUN */ }
+  }
   function createPC() {
     const pc = new RTCPeerConnection({ iceServers: call.iceServers });
     pc.onicecandidate = (e) => {
@@ -696,6 +708,7 @@ a { color: var(--md-primary); text-decoration: none; }
       if (call.state === 'idle') { stream.getTracks().forEach(t => t.stop()); return; }
       call.localStream = stream;
       const lv = document.getElementById('call-local-video'); if (lv) { lv.srcObject = stream; lv.play().catch(() => {}); }
+      await ensureIceServers();
       const pc = createPC();
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
       callSend({ type: 'call:invite', toId: call.peerId, media: call.media });
@@ -715,6 +728,7 @@ a { color: var(--md-primary); text-decoration: none; }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: call.media === 'video' });
       call.localStream = stream;
       const lv = document.getElementById('call-local-video'); if (lv) { lv.srcObject = stream; lv.play().catch(() => {}); }
+      await ensureIceServers();
       const pc = createPC();
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
       showCallUI('out'); // 切换到通话中界面（保留媒体流）

@@ -4,10 +4,12 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioManager
+import android.media.MediaRecorder
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
 import androidx.core.content.ContextCompat
+import com.sanjinchat.wear.network.ApiClient.IceServerConfig
 import com.sanjinchat.wear.network.ChatEvent
 import com.sanjinchat.wear.network.ChatWebSocketClient
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -31,6 +33,7 @@ import org.webrtc.MediaStream
 import org.webrtc.MediaStreamTrack
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
+import org.webrtc.audio.JavaAudioDeviceModule
 import org.webrtc.RtpReceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
@@ -106,6 +109,33 @@ class CallManager(
 
     private var factory: PeerConnectionFactory? = null
     private val initialized = AtomicBoolean(false)
+    private var audioDeviceModule: JavaAudioDeviceModule? = null
+
+    /**
+     * 当前设备是否支持 WebRTC 通话。
+     * 轻量级检测：仅尝试加载 WebRTC native 层，不创建 PeerConnectionFactory / JavaAudioDeviceModule，
+     * 避免在 WS 事件线程上做重型初始化导致阻塞、来电无应答。
+     */
+    @Volatile
+    private var supported: Boolean? = null
+
+    /** 检测设备是否支持 WebRTC（仅执行一次，结果缓存） */
+    fun isCallSupported(): Boolean {
+        supported?.let { return it }
+        val ok = runCatching {
+            if (initialized.compareAndSet(false, true)) {
+                PeerConnectionFactory.initialize(
+                    PeerConnectionFactory.InitializationOptions
+                        .builder(context.applicationContext)
+                        .setEnableInternalTracer(false)
+                        .createInitializationOptions()
+                )
+            }
+            true
+        }.getOrDefault(false)
+        supported = ok
+        return ok
+    }
 
     private var egl: EglBase? = null
 
@@ -133,6 +163,19 @@ class CallManager(
     private val pendingIce = mutableListOf<IceCandidate>()
 
     private var audioManager: AudioManager? = null
+
+    /**
+     * 服务端下发的 ICE 配置（含 TURN）。
+     * 跨网络通话必须依赖 TURN 中继，仅靠 STUN 在对称 NAT 下无法打通。
+     */
+    @Volatile
+    private var remoteIceServers: List<IceServerConfig> = emptyList()
+
+    /** 应用启动时拉取 /api/call/ice 后注入 */
+    fun applyIceServers(list: List<IceServerConfig>) {
+        remoteIceServers = list
+        android.util.Log.i("CallManager", "ICE 配置已更新：${list.size} 条（含 TURN 才能跨网络通话）")
+    }
 
     fun isBusy(): Boolean = _state.value !is CallState.Idle
 
@@ -169,6 +212,10 @@ class CallManager(
     // ==================== 主动呼叫 ====================
 
     fun startCall(peerId: String, peerName: String, media: String) {
+        if (!isCallSupported()) {
+            toast("当前设备不支持音视频通话")
+            return
+        }
         if (isBusy()) { toast("正在通话中"); return }
         if (!hasAudioPermission()) { toast("需要麦克风权限才能通话"); return }
         this.peerId = peerId
@@ -317,6 +364,8 @@ class CallManager(
 
     private fun onInvite(e: ChatEvent.CallInvite) {
         if (e.fromId.isBlank()) return
+        // 注意：不在此处做重型 WebRTC 初始化检测，避免阻塞 WS 事件线程导致无应答。
+        // 即使设备不支持通话，也先响铃，用户接听时再由 createPeerConnection 兜底处理。
         if (isBusy()) {
             ws.sendCallAnswer(e.fromId, false, e.media)
             return
@@ -453,45 +502,163 @@ class CallManager(
         }
     }
 
-    private fun ensureFactory(): PeerConnectionFactory {
+    /**
+     * 创建 PeerConnectionFactory，带多级降级，保证小天才等裁剪 ROM 也能通话：
+     *   1) 硬件编解码 + EGL（默认，性能最好）
+     *   2) 软件编解码 + EGL（无硬件 VP8/H264 时）
+     *   3) 软件编解码 且 不传 EGL（EGL 也不可用时，仍能解码+上屏到 TextureView）
+     * 只有 PeerConnectionFactory.initialize 本身抛错（native 库缺失）才返回 null。
+     */
+    private fun ensureFactory(): PeerConnectionFactory? {
         factory?.let { return it }
-        if (initialized.compareAndSet(false, true)) {
-            PeerConnectionFactory.initialize(
-                PeerConnectionFactory.InitializationOptions
-                    .builder(context.applicationContext)
-                    .setEnableInternalTracer(false)
-                    .createInitializationOptions()
-            )
+        // 1) 初始化 native 层（必须成功，否则说明 WebRTC 库没装好）
+        try {
+            if (initialized.compareAndSet(false, true)) {
+                PeerConnectionFactory.initialize(
+                    PeerConnectionFactory.InitializationOptions
+                        .builder(context.applicationContext)
+                        .setEnableInternalTracer(false)
+                        .createInitializationOptions()
+                )
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("CallManager", "WebRTC native 初始化失败：${t.javaClass.simpleName}: ${t.message}")
+            supported = false
+            return null
         }
-        // 显式指定视频编解码工厂：不设置时部分版本会退化为"无视频能力"，
-        // 表现为音视频轨都能协商成功，但画面永远没有帧。
-        if (egl == null) egl = EglBase.create()
-        val eglCtx = egl!!.eglBaseContext
-        val created = PeerConnectionFactory.builder()
-            .setVideoEncoderFactory(
-                org.webrtc.DefaultVideoEncoderFactory(eglCtx, /* enableIntelVp8Encoder = */ true, /* enableH264HighProfile = */ true)
-            )
-            .setVideoDecoderFactory(org.webrtc.DefaultVideoDecoderFactory(eglCtx))
-            .createPeerConnectionFactory()
-        factory = created
-        return created
+
+        // 2) 尝试创建 EGL（小天才支持 TextureView，通常 EGL 可用；失败则不用 EGL）
+        if (egl == null) {
+            egl = runCatching { EglBase.create() }.getOrNull()
+        }
+        val eglCtx = runCatching { egl?.eglBaseContext }.getOrNull()
+
+        // 2.5) 自定义音频设备模块：小天才等手表的音频路由特殊，
+        // 必须显式指定 JavaAudioDeviceModule，并关闭硬件 AEC/NS（手表通常没有），
+        // 否则 WebRTC 默认 ADM 会找不到麦克风/扬声器，表现为无声。
+        val adm = runCatching {
+            JavaAudioDeviceModule.builder(context)
+                .setUseHardwareAcousticEchoCanceler(false)
+                .setUseHardwareNoiseSuppressor(false)
+                .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                .setSampleRate(16000)
+                .setAudioTrackStateCallback(object : JavaAudioDeviceModule.AudioTrackStateCallback {
+                    override fun onWebRtcAudioTrackStart() {}
+                    override fun onWebRtcAudioTrackStop() {}
+                })
+                .setAudioTrackErrorCallback(object : JavaAudioDeviceModule.AudioTrackErrorCallback {
+                    override fun onWebRtcAudioTrackInitError(s: String?) {
+                        android.util.Log.e("CallManager", "AudioTrack init error: $s")
+                    }
+                    override fun onWebRtcAudioTrackStartError(code: JavaAudioDeviceModule.AudioTrackStartErrorCode?, s: String?) {
+                        android.util.Log.e("CallManager", "AudioTrack start error: $code $s")
+                    }
+                    override fun onWebRtcAudioTrackError(s: String?) {
+                        android.util.Log.e("CallManager", "AudioTrack error: $s")
+                    }
+                })
+                .setAudioRecordStateCallback(object : JavaAudioDeviceModule.AudioRecordStateCallback {
+                    override fun onWebRtcAudioRecordStart() {}
+                    override fun onWebRtcAudioRecordStop() {}
+                })
+                .setAudioRecordErrorCallback(object : JavaAudioDeviceModule.AudioRecordErrorCallback {
+                    override fun onWebRtcAudioRecordInitError(s: String?) {
+                        android.util.Log.e("CallManager", "AudioRecord init error: $s")
+                    }
+                    override fun onWebRtcAudioRecordStartError(code: JavaAudioDeviceModule.AudioRecordStartErrorCode?, s: String?) {
+                        android.util.Log.e("CallManager", "AudioRecord start error: $code $s")
+                    }
+                    override fun onWebRtcAudioRecordError(s: String?) {
+                        android.util.Log.e("CallManager", "AudioRecord error: $s")
+                    }
+                })
+                .createAudioDeviceModule()
+        }.getOrNull()
+        audioDeviceModule = adm
+        if (adm == null) {
+            android.util.Log.w("CallManager", "JavaAudioDeviceModule 创建失败，使用默认 ADM")
+        }
+
+        // 3) 按优先级尝试编解码工厂
+        val strategies: List<Pair<String, () -> PeerConnectionFactory>> = listOf(
+            "硬件编解码+EGL" to {
+                PeerConnectionFactory.builder()
+                    .setAudioDeviceModule(adm)
+                    .setVideoEncoderFactory(org.webrtc.DefaultVideoEncoderFactory(eglCtx, true, true))
+                    .setVideoDecoderFactory(org.webrtc.DefaultVideoDecoderFactory(eglCtx))
+                    .createPeerConnectionFactory()
+            },
+            "软件编解码+EGL" to {
+                PeerConnectionFactory.builder()
+                    .setAudioDeviceModule(adm)
+                    .setVideoEncoderFactory(org.webrtc.SoftwareVideoEncoderFactory())
+                    .setVideoDecoderFactory(org.webrtc.SoftwareVideoDecoderFactory())
+                    .createPeerConnectionFactory()
+            }
+        )
+
+        var lastErr: Throwable? = null
+        for ((name, create) in strategies) {
+            try {
+                val created = create()
+                android.util.Log.i("CallManager", "通话编解码策略：$name")
+                factory = created
+                supported = true
+                return created
+            } catch (t: Throwable) {
+                lastErr = t
+                android.util.Log.w("CallManager", "策略 $name 失败：${t.javaClass.simpleName}: ${t.message}")
+            }
+        }
+
+        // 4) 软件编解码也失败：只创建工厂（至少语音通话可用）
+        try {
+            val created = PeerConnectionFactory.builder()
+                .setAudioDeviceModule(adm)
+                .createPeerConnectionFactory()
+            android.util.Log.i("CallManager", "通话编解码策略：仅软件兜底（视频可能不可用）")
+            factory = created
+            supported = true
+            return created
+        } catch (t: Throwable) {
+            android.util.Log.w("CallManager", "PeerConnectionFactory 创建彻底失败：${t.javaClass.simpleName}: ${t.message}")
+            android.util.Log.w("CallManager", "lastErr=${lastErr?.javaClass?.simpleName}: ${lastErr?.message}")
+            supported = false
+            return null
+        }
     }
 
     private fun createPeerConnection(): PeerConnection? {
         pc?.let { return it }
-        val f = ensureFactory()
-        val iceServers = listOf(
-            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun3.l.google.com:19302").createIceServer(),
-            PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer()
-        )
+        val f = ensureFactory() ?: return null
+        val iceServers = mutableListOf<PeerConnection.IceServer>()
+        // 1) 服务端下发的配置（含 TURN，跨网络通话必需）
+        remoteIceServers.forEach { cfg ->
+            runCatching {
+                val b = PeerConnection.IceServer.builder(cfg.urls)
+                if (!cfg.username.isNullOrBlank()) b.setUsername(cfg.username)
+                if (!cfg.credential.isNullOrBlank()) b.setPassword(cfg.credential)
+                iceServers.add(b.createIceServer())
+            }
+        }
+        // 2) 兜底 STUN
+        if (iceServers.isEmpty()) {
+            listOf(
+                "stun:stun.l.google.com:19302",
+                "stun:stun1.l.google.com:19302",
+                "stun:stun2.l.google.com:19302",
+                "stun:stun3.l.google.com:19302",
+                "stun:stun4.l.google.com:19302"
+            ).forEach { iceServers.add(PeerConnection.IceServer.builder(it).createIceServer()) }
+        }
         val config = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
             iceTransportsType = PeerConnection.IceTransportsType.ALL
+            // 允许 TCP candidate：部分运营商/企业网络封 UDP，TCP 可提升跨网连通率
+            tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED
+            iceCandidatePoolSize = 2
         }
         val observer = object : PeerConnection.Observer {
             override fun onSignalingChange(newState: PeerConnection.SignalingState?) {}
@@ -576,7 +743,8 @@ class CallManager(
     /** 发起方：在 createOffer 之前建立视频通道（有摄像头就收发，没有就只收） */
     private fun setupVideoForOfferer(pc: PeerConnection) {
         if (media != "video") return
-        val vt = startVideoCapture(ensureFactory())
+        val f = factory ?: return
+        val vt = startVideoCapture(f)
         if (vt != null) {
             val ok = runCatching {
                 pc.addTransceiver(
@@ -612,7 +780,8 @@ class CallManager(
             pc.transceivers.firstOrNull { it.receiver?.track()?.kind() == "video" }
         }.getOrNull() ?: return
 
-        val vt = startVideoCapture(ensureFactory())
+        val f = factory ?: return
+        val vt = startVideoCapture(f)
         if (vt != null) {
             runCatching {
                 videoTx.sender?.setTrack(vt, false)
@@ -747,9 +916,20 @@ class CallManager(
         val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         audioManager = am
         runCatching {
+            // 1) 通话模式：部分手表 MODE_IN_COMMUNICATION 不生效，两个都试
             am.mode = AudioManager.MODE_IN_COMMUNICATION
+            // 2) 强制走扬声器（手表没有听筒，必须外放）
             @Suppress("DEPRECATION")
             am.isSpeakerphoneOn = true
+            // 3) 通话音量拉满，避免被系统压到 0
+            val maxCall = am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL)
+            am.setStreamVolume(AudioManager.STREAM_VOICE_CALL, maxCall, 0)
+            // 4) 媒体音量也拉满（部分手表的扬声器走 STREAM_MUSIC）
+            val maxMusic = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, maxMusic, 0)
+            // 5) 关闭麦克风静音
+            @Suppress("DEPRECATION")
+            am.isMicrophoneMute = false
         }
     }
 

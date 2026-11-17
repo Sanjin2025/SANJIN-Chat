@@ -851,6 +851,54 @@ async function handleHttpRequest(req, res) {
       return sendJson(res, 200, { ok: true, deviceName: result.deviceName });
     }
 
+    // ====== 通话 ICE 服务器配置 ======
+    // GET /api/call/ice  （公开，无需登录）
+    // 跨网络通话必须依赖 TURN 中继（STUN 只能解决部分 NAT）。
+    // 优先级：data/iceServers.json > 环境变量 TURN_URL/TURN_USERNAME/TURN_CREDENTIAL > 内置默认
+    if (urlPath === '/api/call/ice' && req.method === 'GET') {
+      const stunList = [
+        { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }
+      ];
+      let iceServers = null;
+      try {
+        const cfgFile = path.join(storage.DATA_DIR, 'iceServers.json');
+        if (fs.existsSync(cfgFile)) {
+          const raw = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+          if (raw && Array.isArray(raw.iceServers) && raw.iceServers.length > 0) {
+            iceServers = raw.iceServers;
+          }
+        }
+      } catch (e) {
+        console.warn('[ICE] 读取 data/iceServers.json 失败:', e.message);
+      }
+      if (!iceServers && process.env.TURN_URL) {
+        iceServers = [
+          ...stunList,
+          {
+            urls: [process.env.TURN_URL],
+            username: process.env.TURN_USERNAME || '',
+            credential: process.env.TURN_CREDENTIAL || ''
+          }
+        ];
+      }
+      if (!iceServers) {
+        // 未配置自有 TURN 时的兜底：公共 Open Relay TURN 服务
+        iceServers = [
+          ...stunList,
+          {
+            urls: [
+              'turn:openrelay.metered.ca:80',
+              'turn:openrelay.metered.ca:443',
+              'turn:openrelay.metered.ca:443?transport=tcp'
+            ],
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+          }
+        ];
+      }
+      return sendJson(res, 200, { ok: true, iceServers });
+    }
+
     // ====== 客户端更新检查 ======
     // GET /api/update/check?channel=stable  （公开，无需登录）
     // channel: stable / beta / 自定义 http(s) URL
